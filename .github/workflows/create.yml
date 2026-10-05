@@ -37,6 +37,8 @@ jobs:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}
           AUTO_PUBLISH: ${{ vars.AUTO_PUBLISH }}
+          VIDEO_MODE: ${{ vars.VIDEO_MODE }}
+          PHOTO_ZOOM: ${{ vars.PHOTO_ZOOM }}
       - name: Save data (history, heroes)
         if: always()
         run: |
