@@ -354,17 +354,33 @@ def validate_story(s):
 
 # ───────────────────────── озвучка и сборка ─────────────────────────
 
-async def _tts(text, path):
+async def _tts(text, path, voice, rate):
     import edge_tts
-    await edge_tts.Communicate(text, VOICE, rate="+6%").save(str(path))
+    await edge_tts.Communicate(text, voice, rate=rate).save(str(path))
 
 
 def make_voice(text, path):
     if OFFLINE:
         run(["ffmpeg", "-y", "-f", "lavfi", "-i",
              f"sine=f=220:d={0.38 * len(text.split()):.2f}", str(path)])
-    else:
-        asyncio.run(_tts(text, path))
+        return
+    # edge-tts иногда не отдаёт звук (лимиты Microsoft): повторяем, меняем скорость и голос
+    clean = re.sub(r"[\"«»“”„]", "", text).strip() or "..."
+    last = None
+    for attempt in range(6):
+        voice = VOICE if attempt < 4 else "ru-RU-SvetlanaNeural"
+        rate = "+6%" if attempt % 2 == 0 else "+0%"
+        try:
+            asyncio.run(_tts(clean, path, voice, rate))
+            if path.exists() and path.stat().st_size > 1000:
+                time.sleep(0.7)
+                return
+            last = "пустой файл"
+        except Exception as e:  # noqa
+            last = e
+        log(f"озвучка: попытка {attempt + 1} не удалась ({last})")
+        time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"Не удалось озвучить фразу «{text}»: {last}")
 
 
 def subtitle_filters(text, tag):
