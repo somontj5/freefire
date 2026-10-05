@@ -32,7 +32,7 @@ WORK = ROOT / "work"
 CHARS = (WORK / "chars_offline") if OFFLINE else (ROOT / "characters")
 
 GEMINI_KEY = ENV("GEMINI_API_KEY", "")
-GEMINI_MODEL = ENV("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_MODELS = [m for m in [ENV("GEMINI_MODEL"), "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"] if m]
 TG_TOKEN = ENV("TG_TOKEN", "")
 TG_CHAT = ENV("TG_CHAT_ID", "")
 IG_USER = ENV("IG_USER_ID", "")
@@ -128,24 +128,28 @@ def notify(text):
 # ───────────────────────── Gemini ─────────────────────────
 
 def gemini(prompt, as_json=True):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     cfg = {"temperature": 1.0}
     if as_json:
         cfg["responseMimeType"] = "application/json"
     body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}
     last = None
-    for attempt in range(4):
-        r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=180)
-        if r.status_code in (429, 500, 503):
-            last = r.text[:300]
-            time.sleep(10 * (attempt + 1))
-            continue
-        r.raise_for_status()
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        if not as_json:
-            return text
-        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-        return json.loads(text)
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(3):
+            r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=180)
+            if r.status_code in (429, 500, 503):
+                last = f"{model}: {r.status_code}"
+                time.sleep(10 * (attempt + 1))
+                continue
+            if r.status_code == 404:
+                last = f"{model}: модель не найдена"
+                break
+            r.raise_for_status()
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            if not as_json:
+                return text
+            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+            return json.loads(text)
     raise RuntimeError(f"Gemini недоступен: {last}")
 
 
@@ -153,7 +157,7 @@ def gemini(prompt, as_json=True):
 
 def pollinations(prompt, path, seed):
     from urllib.parse import quote
-    url = "https://image.pollinations.ai/prompt/" + quote(f"{prompt}, {STYLE}"[:600])
+    url = "https://gen.pollinations.ai/image/" + quote(f"{prompt}, {STYLE}"[:600])
     params = {"width": 1024, "height": 1024, "seed": seed, "nologo": "true", "model": "flux"}
     headers = {"User-Agent": "video-bot/1.0"}
     if POLL_KEY:
