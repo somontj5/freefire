@@ -39,6 +39,10 @@ IG_USER = ENV("IG_USER_ID", "")
 IG_TOKEN = ENV("IG_ACCESS_TOKEN", "")
 POLL_KEY = ENV("POLLINATIONS_KEY", "")
 AUTO_PUBLISH = (ENV("AUTO_PUBLISH") or "").lower() in ("1", "true", "yes")
+# photo  - каждая сцена одно готовое фото (по умолчанию)
+# layers - послойная анимация: фон, герои и предметы отдельно
+MODE = (ENV("VIDEO_MODE") or "photo").lower()
+PHOTO_ZOOM = (ENV("PHOTO_ZOOM") or "").lower() in ("1", "true", "yes")  # лёгкий наезд на фото
 VOICE = ENV("TTS_VOICE") or "ru-RU-DmitryNeural"
 FB = "https://graph.facebook.com/v21.0"
 
@@ -157,7 +161,7 @@ def gemini(prompt, as_json=True):
 
 def pollinations(prompt, path, seed):
     from urllib.parse import quote
-    url = "https://gen.pollinations.ai/image/" + quote(f"{prompt}, {STYLE}"[:600])
+    url = "https://gen.pollinations.ai/image/" + quote(f"{prompt}, {STYLE}"[:900])
     params = {"width": 1024, "height": 1024, "seed": seed, "nologo": "true", "model": "flux"}
     headers = {"User-Agent": "video-bot/1.0"}
     if POLL_KEY:
@@ -181,7 +185,19 @@ def fake_image(kind, key, path):
     from PIL import Image, ImageDraw
     rnd = random.Random(key)
     col = tuple(rnd.randint(60, 220) for _ in range(3))
-    if kind == "bg":
+    if kind == "scene":
+        im = Image.new("RGB", (1024, 1024))
+        d = ImageDraw.Draw(im)
+        for y in range(1024):
+            d.line([(0, y), (1024, y)], fill=(col[0] - y // 8 % 60, col[1] - y // 14, 90 + y // 7))
+        d.rectangle([0, 780, 1024, 1024], fill=(40, 90, 50))
+        for x in (260, 700):
+            c2 = tuple(rnd.randint(60, 220) for _ in range(3))
+            d.ellipse([x, 330, x + 120, 450], fill=(240, 200, 160))
+            d.rectangle([x - 10, 450, x + 130, 700], fill=c2)
+            d.rectangle([x, 700, x + 50, 840], fill=(60, 60, 90))
+            d.rectangle([x + 70, 700, x + 120, 840], fill=(60, 60, 90))
+    elif kind == "bg":
         im = Image.new("RGB", (1024, 1024))
         d = ImageDraw.Draw(im)
         for y in range(1024):
@@ -241,23 +257,34 @@ def load_cast():
     return out
 
 
-def ensure_character(name, desc, cast):
+def ensure_character(name, desc, cast, portrait=True):
+    """Герой хранится в characters/. Портрет (PNG без фона) нужен только для режима layers."""
     key = name.lower()
-    if key in cast:
-        return cast[key]
-    d = CHARS / slug(name)
-    d.mkdir(parents=True, exist_ok=True)
-    seed = random.randint(1, 10_000_000)
-    raw = d / "raw.png"
-    gen_image("char", f"{desc}, full body, standing, front view, plain solid white background", raw, seed)
-    cutout(raw, d / "portrait.png")
-    raw.unlink(missing_ok=True)
-    meta = {"name": name, "description": desc, "seed": seed, "created": now_iso()}
-    (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-    meta["dir"] = d
-    cast[key] = meta
-    log(f"новый герой: {name}")
-    return meta
+    c = cast.get(key)
+    if c is None:
+        d = CHARS / slug(name)
+        d.mkdir(parents=True, exist_ok=True)
+        c = {"name": name, "description": desc, "seed": random.randint(1, 10_000_000),
+             "created": now_iso()}
+        (d / "meta.json").write_text(json.dumps(c, ensure_ascii=False, indent=1), encoding="utf-8")
+        c["dir"] = d
+        cast[key] = c
+        log(f"новый герой: {name}")
+    if portrait and not (c["dir"] / "portrait.png").exists():
+        raw = c["dir"] / "raw.png"
+        gen_image("char", f"{c['description']}, full body, standing, front view, plain solid white background",
+                  raw, c["seed"])
+        cutout(raw, c["dir"] / "portrait.png")
+        raw.unlink(missing_ok=True)
+    return c
+
+
+def expand_prompt(text, cast):
+    """[Рэд] в промпте сцены заменяется на описание внешности героя - так он выглядит одинаково."""
+    def sub(m):
+        c = cast.get(m.group(1).strip().lower())
+        return c["description"] if c else m.group(1)
+    return re.sub(r"\[([^\]]+)\]", sub, text)
 
 
 _char_cache = {}
@@ -316,6 +343,82 @@ SAMPLE_STORY = {
          "prop": None, "prop_motion": "none", "sfx": "hit"},
     ],
 }
+
+SAMPLE_STORY_PHOTO = {
+    "title": "Последний бросок",
+    "summary": "Рэд бросает гранату во врага и выигрывает матч.",
+    "caption": "Он бросил гранату... 😱 #freefire #история #battleroyale",
+    "cast": [
+        {"name": "Рэд", "description": "young soldier in red bandana, green tactical vest, backpack"},
+        {"name": "Враг", "description": "enemy soldier in black armor and gas mask"},
+    ],
+    "scenes": [
+        {"narration": "Рэд крался с автоматом в руках",
+         "image_prompt": "[Рэд] sneaking through a ruined village at sunset, holding an assault rifle", "sfx": "none"},
+        {"narration": "Впереди стоял вражеский боец",
+         "image_prompt": "[Рэд] crouching behind a wall, [Враг] standing in the street ahead with a rifle", "sfx": "none"},
+        {"narration": "Рэд бросил гранату во врага",
+         "image_prompt": "[Рэд] on the left throwing a grenade, grenade flying through the air toward [Враг] on the right",
+         "sfx": "whoosh"},
+        {"narration": "Взрыв накрыл вражескую позицию",
+         "image_prompt": "big explosion on the street, [Враг] thrown back by the blast, [Рэд] watching from afar",
+         "sfx": "boom"},
+        {"narration": "Рэд победил в этом матче",
+         "image_prompt": "[Рэд] on a victory podium on the beach holding a golden trophy", "sfx": "hit"},
+    ],
+}
+
+
+def story_prompt_photo(videos, cast):
+    hist = []
+    for v in videos[-20:]:
+        st = v.get("stats") or {}
+        hist.append(f"- {v['title']}: {v.get('summary', '')} | статус: {v['status']} | "
+                    f"просмотры: {st.get('views', '?')}, лайки: {st.get('likes', '?')}, "
+                    f"комментарии: {st.get('comments', '?')}")
+    heroes = [f"- {c['name']}: {c['description']}" for c in cast.values()]
+    return f"""Ты сценарист коротких вертикальных видео (Instagram Reels) про мир Free Fire (королевская битва).
+Видео - слайдшоу из картинок: каждая сцена это ОДНА готовая картинка, на которой уже есть всё: герои, предметы в руках, действие, фон.
+Придумай НОВУЮ цельную историю с завязкой, напряжением и сильной концовкой или твистом.
+Не копируй официальных персонажей игры: герои вымышленные.
+
+Уже снятые ролики и их результаты (не повторяй сюжеты, учитывай, что заходит лучше):
+{chr(10).join(hist) or '- пока нет'}
+
+Уже существующие герои (можно использовать снова, тогда НЕ добавляй их в cast):
+{chr(10).join(heroes) or '- пока нет'}
+
+ПРАВИЛА
+- 12-16 сцен, каждая = одна картинка на 2-3 секунды.
+- narration: по-русски, 5-8 слов, живая речь диктора. Вместе фразы складываются в историю.
+- image_prompt: ТОЛЬКО по-английски, одно предложение: что именно на картинке. Должен ТОЧНО совпадать с narration:
+  кто в кадре, что делает, что держит в руках, где находится враг, куда летит предмет, что происходит вокруг.
+  Если в тексте бросили гранату во врага, на картинке виден бросающий, летящая граната и враг, в которого она летит.
+  Композиция понятная, герои крупно, не более 2-3 героев. Никаких надписей на картинке.
+- Героев в image_prompt пиши по имени в квадратных скобках: [Рэд]. Код сам подставит их внешность.
+  Враги и противники тоже герои: добавляй их в cast.
+- cast: только НОВЫЕ герои (до 4), description по-английски: внешность, одежда, цвета, без имён.
+- caption: по-русски, цепляющая подпись и 3-5 хештегов.
+- sfx: "whoosh", "hit", "boom", "shot" или "none".
+
+Верни ТОЛЬКО JSON:
+{{"title": "...", "summary": "1 предложение о сюжете", "caption": "...",
+ "cast": [{{"name": "...", "description": "..."}}],
+ "scenes": [{{"narration": "...", "image_prompt": "...", "sfx": "none"}}]}}"""
+
+
+def validate_photo_story(s):
+    scenes = s.get("scenes") or []
+    if len(scenes) < 4:
+        raise RuntimeError("Gemini вернул слишком короткую историю")
+    for sc in scenes:
+        sc["narration"] = str(sc.get("narration", "")).strip()
+        sc["image_prompt"] = str(sc.get("image_prompt", "")).strip() or sc["narration"]
+        if sc.get("sfx") not in SFX:
+            sc["sfx"] = "none"
+        sc["prop"], sc["prop_motion"], sc["prop_side"] = None, "none", "center"
+    return s
+
 
 MOTIONS = ("throw_right", "throw_left", "fall", "appear", "explosion")
 
@@ -427,7 +530,7 @@ def subtitle_filters(text, tag):
     return ",".join(parts)
 
 
-def render_scene(tag, sc, bg, chars, prop, voice):
+def render_scene(tag, sc, bg, chars, prop, voice, photo=False):
     """chars: список (путь, зеркалить?)."""
     from PIL import Image
     vlen = duration(voice)
@@ -459,10 +562,11 @@ def render_scene(tag, sc, bg, chars, prop, voice):
         n += 1
 
     ease = "(1-pow(1-min(t/0.7,1),3))"
-    shake = sc["prop_motion"] == "explosion" or sc["sfx"] == "boom"
+    zoom = (0.05 if PHOTO_ZOOM else 0.0) if photo else 0.08
+    shake = (not photo) and (sc["prop_motion"] == "explosion" or sc["sfx"] == "boom")
     cx = f"(in_w-{BOX})/2" + ("+16*sin(80*t)*between(t,0.5,1.2)" if shake else "")
     cy = f"(in_h-{BOX})/2" + ("+10*cos(70*t)*between(t,0.5,1.2)" if shake else "")
-    fc = [f"[{ib}:v]scale=w='trunc({BOX}*(1+0.08*t/{d})/2)*2':h='trunc({BOX}*(1+0.08*t/{d})/2)*2':"
+    fc = [f"[{ib}:v]scale=w='trunc({BOX}*(1+{zoom}*t/{d})/2)*2':h='trunc({BOX}*(1+{zoom}*t/{d})/2)*2':"
           f"eval=frame,crop={BOX}:{BOX}:'{cx}':'{cy}',format=rgba[l0]"]
     last = "l0"
     ch = 600 if len(ics) > 1 else 640
@@ -641,16 +745,31 @@ def cmd_create():
         refresh_stats()
         videos = load_videos()
         cast = load_cast()
-        story = SAMPLE_STORY if OFFLINE else gemini(story_prompt(videos, cast))
-        story = validate_story(story)
+        photo = MODE == "photo"
+        if OFFLINE:
+            story = SAMPLE_STORY_PHOTO if photo else SAMPLE_STORY
+        else:
+            story = gemini((story_prompt_photo if photo else story_prompt)(videos, cast))
+        story = validate_photo_story(story) if photo else validate_story(story)
         for c in story.get("cast") or []:
-            ensure_character(c["name"], c["description"], cast)
+            ensure_character(c["name"], c["description"], cast, portrait=not photo)
+        if not photo:
+            for c in list(cast.values()):
+                ensure_character(c["name"], c["description"], cast, portrait=True)
 
         parts = []
         for i, sc in enumerate(story["scenes"]):
             tag = f"s{i:02d}"
             log(f"сцена {i + 1}/{len(story['scenes'])}: {sc['narration']}")
             seed = random.Random(f"{vid}{i}").randint(1, 10_000_000)
+            if photo:
+                img = WORK / f"{tag}_img.png"
+                gen_image("scene", expand_prompt(sc["image_prompt"], cast) + ", no text, no letters, no watermark",
+                          img, seed)
+                voice = WORK / f"{tag}.mp3"
+                make_voice(sc["narration"], voice)
+                parts.append(render_scene(tag, sc, img, [], None, voice, photo=True))
+                continue
             bg = WORK / f"{tag}_bg.png"
             gen_image("bg", sc["background"] + ", wide scene, no characters", bg, seed)
             layers = []
