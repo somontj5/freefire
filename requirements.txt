@@ -1,0 +1,5 @@
+requests
+edge-tts
+rembg
+onnxruntime
+pillow
