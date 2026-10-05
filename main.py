@@ -260,43 +260,64 @@ def ensure_character(name, desc, cast):
     return meta
 
 
-def char_layer(c, pose, tag):
-    if not pose or pose.lower() in ("default", "stand", "standing", "idle"):
-        return c["dir"] / "portrait.png"
-    raw = WORK / f"{tag}_raw.png"
-    out = WORK / f"{tag}.png"
-    gen_image("char", f"{c['description']}, {pose}, full body, plain solid white background", raw, c["seed"])
+_char_cache = {}
+
+
+def char_layer(c, pose, holding, slot, tag):
+    """Герой + всё, что у него в руках, генерируются ВМЕСТЕ одной картинкой.
+    Возвращает (путь, нужно ли зеркалить)."""
+    default = not pose or pose.lower() in ("default", "stand", "standing", "idle")
+    if default and not holding:
+        return c["dir"] / "portrait.png", slot == 1
+    facing = "right" if slot == 0 else "left"
+    key = (c["name"], (pose or "").lower(), (holding or "").lower(), facing)
+    if key in _char_cache:
+        return _char_cache[key], False
+    parts = [c["description"]]
+    if not default:
+        parts.append(pose)
+    if holding:
+        parts.append(f"holding {holding} in hands")
+    parts.append(f"full body, facing {facing}, side view, plain solid white background")
+    raw, out = WORK / f"{tag}_raw.png", WORK / f"{tag}.png"
+    gen_image("char", ", ".join(parts), raw, c["seed"])
     cutout(raw, out)
-    return out
+    _char_cache[key] = out
+    return out, False
 
 
 # ───────────────────────── сценарий ─────────────────────────
 
 SAMPLE_STORY = {
-    "title": "Последний прыжок",
-    "summary": "Новичок Рэд падает на остров, находит гранату и спасает команду.",
-    "caption": "Он думал, что это конец... 😱 #freefire #история #battleroyale",
+    "title": "Последний бросок",
+    "summary": "Рэд бросает гранату во врага и выигрывает матч.",
+    "caption": "Он бросил гранату... 😱 #freefire #история #battleroyale",
     "cast": [
         {"name": "Рэд", "description": "young soldier in red bandana, green tactical vest, backpack"},
-        {"name": "Лис", "description": "girl sniper with orange hair, black hoodie, long rifle"},
+        {"name": "Враг", "description": "enemy soldier in black armor and gas mask"},
     ],
     "scenes": [
-        {"narration": "Рэд выпрыгнул из вертолёта", "background": "helicopter high above island, sky",
-         "characters": [{"name": "Рэд", "pose": "default"}], "prop": None, "prop_motion": "none", "sfx": "whoosh"},
-        {"narration": "Внизу он увидел гранату", "background": "jungle clearing with ruins",
-         "characters": [{"name": "Рэд", "pose": "default"}], "prop": "hand grenade",
-         "prop_motion": "fly", "sfx": "whoosh"},
-        {"narration": "Лис кричала: бросай её скорее", "background": "old ruined bridge, sunset",
-         "characters": [{"name": "Рэд", "pose": "default"}, {"name": "Лис", "pose": "default"}],
-         "prop": "hand grenade", "prop_motion": "fall", "sfx": "shot"},
-        {"narration": "Взрыв разнёс вражеский лагерь", "background": "enemy camp tents in the desert",
-         "characters": [{"name": "Лис", "pose": "default"}], "prop": "explosion fireball",
-         "prop_motion": "static", "sfx": "boom"},
-        {"narration": "Команда победила в этом матче", "background": "victory podium on the beach",
-         "characters": [{"name": "Рэд", "pose": "default"}, {"name": "Лис", "pose": "default"}],
-         "prop": "golden trophy", "prop_motion": "static", "sfx": "hit"},
+        {"narration": "Рэд крался с автоматом в руках", "background": "ruined village at sunset",
+         "characters": [{"name": "Рэд", "pose": "sneaking", "holding": "assault rifle"}],
+         "prop": None, "prop_motion": "none", "sfx": "none"},
+        {"narration": "Впереди стоял вражеский боец", "background": "ruined village street",
+         "characters": [{"name": "Рэд", "pose": "crouching", "holding": "hand grenade"},
+                        {"name": "Враг", "pose": "default", "holding": "rifle"}],
+         "prop": None, "prop_motion": "none", "sfx": "none"},
+        {"narration": "Рэд бросил гранату во врага", "background": "ruined village street",
+         "characters": [{"name": "Рэд", "pose": "just threw a grenade, arm extended forward, empty hand"},
+                        {"name": "Враг", "pose": "default", "holding": "rifle"}],
+         "prop": "hand grenade", "prop_motion": "throw_right", "sfx": "whoosh"},
+        {"narration": "Взрыв накрыл вражескую позицию", "background": "ruined village street",
+         "characters": [{"name": "Рэд", "pose": "default"}],
+         "prop": "explosion fireball", "prop_motion": "explosion", "prop_side": "right", "sfx": "boom"},
+        {"narration": "Рэд победил в этом матче", "background": "victory podium on the beach",
+         "characters": [{"name": "Рэд", "pose": "victory pose", "holding": "golden trophy"}],
+         "prop": None, "prop_motion": "none", "sfx": "hit"},
     ],
 }
+
+MOTIONS = ("throw_right", "throw_left", "fall", "appear", "explosion")
 
 
 def story_prompt(videos, cast):
@@ -317,22 +338,32 @@ def story_prompt(videos, cast):
 Уже существующие герои (можно использовать снова, тогда НЕ добавляй их в cast):
 {chr(10).join(heroes) or '- пока нет'}
 
-Правила:
+ОБЩИЕ ПРАВИЛА
 - 12-16 сцен, каждая сцена = один кадр на 2-3 секунды.
 - narration: по-русски, 5-8 слов, живая речь диктора. Вместе фразы складываются в историю.
-- background, prop, pose: ТОЛЬКО по-английски, коротко и визуально, строго по смыслу narration этой сцены.
-- В кадре максимум 2 героя. pose = "default" (предпочтительно) или короткое английское описание позы.
-- prop: предмет, с которым взаимодействуют герои, или null. prop_motion: "fly" (пролетает), "fall" (падает сверху), "static" (появляется), "none".
-- sfx: "whoosh", "hit", "boom", "shot" или "none".
-- cast: только НОВЫЕ герои (до 3), description по-английски: внешность, одежда, цвета.
+- background, prop, pose, holding: ТОЛЬКО по-английски, коротко и визуально, СТРОГО по смыслу narration этой сцены.
+- В кадре максимум 2 персонажа. Враги и противники тоже персонажи (добавляй их в cast).
+- cast: только НОВЫЕ герои (до 4), description по-английски: внешность, одежда, цвета.
 - caption: по-русски, цепляющая подпись и 3-5 хештегов.
+- sfx: "whoosh", "hit", "boom", "shot" или "none".
+
+ПРЕДМЕТЫ (очень важно)
+- Всё, что персонаж ДЕРЖИТ в руках (оружие, граната, трофей, рюкзак, аптечка), указывай в поле holding этого персонажа. Картинка героя рисуется сразу вместе с предметом. НЕ дублируй такой предмет в prop.
+- prop только для предметов ВНЕ рук: летящих, падающих, лежащих, взрывов. Иначе prop = null.
+- prop_motion: "throw_right" (предмет вылетает из руки ЛЕВОГО по кадру героя и летит вправо), "throw_left" (вылетает из руки ПРАВОГО героя и летит влево), "fall" (падает сверху, например аирдроп), "appear" (лежит или появляется), "explosion" (взрыв), "none".
+- prop_side для fall/appear/explosion: "left", "center" или "right".
+
+БРОСКИ
+- Первый персонаж в characters стоит слева, второй справа. Бросает ПЕРВЫЙ -> throw_right, цель (враг) вторым персонажем справа. Бросает ВТОРОЙ -> throw_left, цель первым слева.
+- В сцене броска у бросающего pose = "just threw <предмет>, arm extended forward, empty hand" и без holding этого предмета.
+- Если narration говорит, что бросили/выстрелили во врага, враг обязан быть в кадре на стороне, куда летит предмет. Взрыв показывай следующей сценой с prop_side стороны врага.
 
 Верни ТОЛЬКО JSON:
 {{"title": "...", "summary": "1 предложение о сюжете", "caption": "...",
  "cast": [{{"name": "...", "description": "..."}}],
  "scenes": [{{"narration": "...", "background": "...",
-   "characters": [{{"name": "...", "pose": "default"}}],
-   "prop": null, "prop_motion": "none", "sfx": "none"}}]}}"""
+   "characters": [{{"name": "...", "pose": "default", "holding": null}}],
+   "prop": null, "prop_motion": "none", "prop_side": "center", "sfx": "none"}}]}}"""
 
 
 def validate_story(s):
@@ -343,12 +374,14 @@ def validate_story(s):
         sc["narration"] = str(sc.get("narration", "")).strip()
         sc["background"] = str(sc.get("background", "jungle island")).strip()
         sc["characters"] = (sc.get("characters") or [])[:2]
-        if sc.get("prop_motion") not in ("fly", "fall", "static"):
+        if sc.get("prop_motion") not in MOTIONS:
             sc["prop_motion"] = "none"
+        if sc.get("prop_side") not in ("left", "center", "right"):
+            sc["prop_side"] = "center"
         if sc.get("sfx") not in SFX:
             sc["sfx"] = "none"
-        if not sc.get("prop"):
-            sc["prop"] = None
+        if not sc.get("prop") or sc["prop_motion"] == "none":
+            sc["prop"], sc["prop_motion"] = None, "none"
     return s
 
 
@@ -395,6 +428,8 @@ def subtitle_filters(text, tag):
 
 
 def render_scene(tag, sc, bg, chars, prop, voice):
+    """chars: список (путь, зеркалить?)."""
+    from PIL import Image
     vlen = duration(voice)
     tempo = min(vlen / 2.75, 1.35) if vlen > 2.75 else 1.0
     d = round(min(max(vlen / tempo + 0.3, 2.0), 3.0), 2)
@@ -408,7 +443,7 @@ def render_scene(tag, sc, bg, chars, prop, voice):
         return n - 1
 
     ib = add_img(bg)
-    ics = [add_img(p) for p in chars]
+    ics = [add_img(p) for p, _ in chars]
     ip = add_img(prop) if prop else None
     cmd.extend(["-i", str(voice)])
     iv = n
@@ -424,33 +459,54 @@ def render_scene(tag, sc, bg, chars, prop, voice):
         n += 1
 
     ease = "(1-pow(1-min(t/0.7,1),3))"
-    p = "min(max(t-0.3,0)/0.9,1)"
+    shake = sc["prop_motion"] == "explosion" or sc["sfx"] == "boom"
+    cx = f"(in_w-{BOX})/2" + ("+16*sin(80*t)*between(t,0.5,1.2)" if shake else "")
+    cy = f"(in_h-{BOX})/2" + ("+10*cos(70*t)*between(t,0.5,1.2)" if shake else "")
     fc = [f"[{ib}:v]scale=w='trunc({BOX}*(1+0.08*t/{d})/2)*2':h='trunc({BOX}*(1+0.08*t/{d})/2)*2':"
-          f"eval=frame,crop={BOX}:{BOX}:(in_w-{BOX})/2:(in_h-{BOX})/2,format=rgba[l0]"]
+          f"eval=frame,crop={BOX}:{BOX}:'{cx}':'{cy}',format=rgba[l0]"]
     last = "l0"
     ch = 600 if len(ics) > 1 else 640
+    widths = []
     for k, ic in enumerate(ics):
-        flip = ",hflip" if k == 1 else ""
-        fc.append(f"[{ic}:v]scale=-2:{ch}{flip},format=rgba[c{k}]")
-        if k == 0:
-            x = f"-w+(w+70)*{ease}"
-        else:
-            x = f"{BOX}-(w+70)*{ease}"
+        path, flip = chars[k]
+        iw, ih = Image.open(path).size
+        widths.append(int(iw * ch / ih))
+        fc.append(f"[{ic}:v]scale=-2:{ch}{',hflip' if flip else ''},format=rgba[c{k}]")
+        x = f"-w+(w+70)*{ease}" if k == 0 else f"{BOX}-(w+70)*{ease}"
         fc.append(f"[{last}][c{k}]overlay=x='{x}':y='H-h+30+7*sin(7*t+{k})':eval=frame[l{k + 1}]")
         last = f"l{k + 1}"
+
     if ip is not None:
         mot = sc["prop_motion"]
-        if mot == "fly":
-            fc.append(f"[{ip}:v]scale=-2:190,format=rgba,rotate=a='t*7':ow='hypot(iw,ih)':oh=ow:c=none[pr]")
-            pos = f"x='{BOX}-60-420*{p}':y='430-170*sin(PI*{p})'"
+        sidex = int({"left": 0.26, "center": 0.5, "right": 0.74}[sc["prop_side"]] * BOX)
+        T0, DUR = 0.4, 0.9
+        p = f"min(max(t-{T0},0)/{DUR},1)"
+        hand_y = int(BOX - ch + 30 + 0.40 * ch)
+        if mot in ("throw_right", "throw_left"):
+            if mot == "throw_right" or len(widths) < 2:
+                x0 = 70 + int(0.78 * widths[0]) if widths else 300
+                x1 = BOX - 90 if mot == "throw_right" else 90
+            else:
+                x0 = BOX - 70 - int(0.78 * widths[1])
+                x1 = 90
+            y1 = int(BOX * 0.74)
+            fc.append(f"[{ip}:v]scale=-2:150,format=rgba,rotate=a='t*9':ow='hypot(iw,ih)':oh=ow:c=none[pr]")
+            pos = (f"x='{x0}+({x1}-{x0})*{p}-w/2':y='{hand_y}+({y1}-{hand_y})*{p}-240*sin(PI*{p})-h/2':"
+                   f"eval=frame:enable='between(t,{T0},{T0 + DUR})'")
         elif mot == "fall":
-            fc.append(f"[{ip}:v]scale=-2:190,format=rgba,rotate=a='t*4':ow='hypot(iw,ih)':oh=ow:c=none[pr]")
-            pos = f"x='(W-w)/2+150':y='-h+(H*0.8+h)*pow({p},2)'"
-        else:
+            fc.append(f"[{ip}:v]scale=-2:190,format=rgba,rotate=a='t*3':ow='hypot(iw,ih)':oh=ow:c=none[pr]")
+            pos = (f"x='{sidex}-w/2':y='-h+({int(BOX * 0.62)}+h)*pow({p},2)':"
+                   f"eval=frame:enable='gte(t,{T0})'")
+        elif mot == "explosion":
+            size = "trunc((120+420*min(max(t-0.5,0)/0.35,1))/2)*2"
+            fc.append(f"[{ip}:v]format=rgba,scale=w='{size}':h='{size}':eval=frame[pr]")  # format ДО scale, иначе размер не меняется
+            pos = f"x='{sidex}-w/2':y='{int(BOX * 0.55)}-h/2':eval=frame:enable='gte(t,0.5)'"
+        else:  # appear
             fc.append(f"[{ip}:v]scale=-2:230,format=rgba[pr]")
-            pos = "x='W*0.5-w/2':y='H*0.5'"
-        fc.append(f"[{last}][pr]overlay={pos}:eval=frame:enable='gte(t,0.3)'[lp]")
+            pos = f"x='{sidex}-w/2':y='{int(BOX * 0.55)}+6*sin(5*t)':eval=frame:enable='gte(t,{T0})'"
+        fc.append(f"[{last}][pr]overlay={pos}[lp]")
         last = "lp"
+
     fc.append(f"[{icv}:v][{last}]overlay={BOX_X}:{BOX_Y}[canvas]")
     fc.append(f"[canvas]{subtitle_filters(sc['narration'], tag)}[v]")
 
@@ -601,7 +657,7 @@ def cmd_create():
             for k, ch in enumerate(sc["characters"]):
                 c = cast.get(str(ch.get("name", "")).lower())
                 if c:
-                    layers.append(char_layer(c, ch.get("pose"), f"{tag}_c{k}"))
+                    layers.append(char_layer(c, ch.get("pose"), ch.get("holding"), k, f"{tag}_c{k}"))
             prop = None
             if sc["prop"]:
                 raw = WORK / f"{tag}_prop_raw.png"
