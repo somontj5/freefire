@@ -50,7 +50,9 @@ STORY_TYPE = (ENV("STORY_TYPE") or "real").lower()
 # Эксперимент: герои по референс-картинке (Pollinations kontext) вместо одного текстового описания
 CHAR_REF = (ENV("CHAR_REF") or "").lower() in ("1", "true", "yes")
 REF_MODEL = ENV("REF_MODEL") or "kontext"
-FB = "https://graph.facebook.com/v21.0"
+# Токен из «Instagram API с входом через Instagram» начинается с IG, из входа через Facebook - с EAA.
+FB = ("https://graph.instagram.com/v21.0" if IG_TOKEN.startswith("IG")
+      else "https://graph.facebook.com/v21.0")
 
 W, H = 1080, 1920
 BOX = 900
