@@ -139,23 +139,45 @@ def notify(text):
 
 # ───────────────────────── Gemini ─────────────────────────
 
-def _gemini_request(body):
-    last = None
+def _err_text(r):
+    try:
+        return str(r.json()["error"]["message"])[:220]
+    except Exception:  # noqa
+        return r.text[:220]
+
+
+def _retry_delay(r):
+    try:
+        for d in r.json()["error"].get("details", []):
+            if "retryDelay" in d:
+                return float(str(d["retryDelay"]).rstrip("s"))
+    except Exception:  # noqa
+        pass
+    return None
+
+
+def _gemini_request(body, patient=True):
+    errors = []
     for model in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        for attempt in range(3):
+        for attempt in range(3 if patient else 1):
             r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=240)
             if r.status_code in (429, 500, 503):
-                last = f"{model}: {r.status_code}"
-                time.sleep(10 * (attempt + 1))
+                errors.append(f"{model}: {r.status_code} {_err_text(r)}")
+                if not patient:
+                    break
+                wait = _retry_delay(r) or 10 * (attempt + 1)
+                if wait > 75:
+                    break
+                time.sleep(wait + 1)
                 continue
             if r.status_code == 404:
-                last = f"{model}: модель не найдена"
+                errors.append(f"{model}: модель не найдена")
                 break
             if not r.ok:
-                raise RuntimeError(f"Gemini {model} {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(f"Gemini {model} {r.status_code}: {_err_text(r)}")
             return r.json()
-    raise RuntimeError(f"Gemini недоступен: {last}")
+    raise RuntimeError("Gemini недоступен: " + " | ".join(errors[-4:]))
 
 
 def _text_of(resp):
@@ -178,7 +200,7 @@ def gemini_search(prompt):
     """Ответ Gemini с поиском Google. Возвращает (текст, [источники])."""
     resp = _gemini_request({"contents": [{"parts": [{"text": prompt}]}],
                             "tools": [{"google_search": {}}],
-                            "generationConfig": {"temperature": 0.4}})
+                            "generationConfig": {"temperature": 0.4}}, patient=False)
     srcs = []
     meta = resp["candidates"][0].get("groundingMetadata") or {}
     for ch in meta.get("groundingChunks") or []:
@@ -814,15 +836,68 @@ def publish_video(v, data):
 
 # ───────────────────────── команда create ─────────────────────────
 
+WIKI_UA = {"User-Agent": "video-bot/1.0 (educational project)"}
+WIKI_QUERIES = ["Garena Free Fire", "Free Fire World Series", "Free Fire Pro League",
+                "Free Fire esports", "Garena", "Free Fire Continental Series"]
+
+
+def wiki_sources():
+    """Запасной источник фактов: статьи Википедии (без поиска Google)."""
+    from urllib.parse import quote
+    pages, seen = [], set()
+    for q in random.sample(WIKI_QUERIES, 3):
+        for lang in ("ru", "en"):
+            try:
+                api = f"https://{lang}.wikipedia.org/w/api.php"
+                r = requests.get(api, params={"action": "query", "list": "search", "srsearch": q,
+                                              "srlimit": 2, "format": "json"}, headers=WIKI_UA, timeout=30)
+                for hit in r.json().get("query", {}).get("search", []):
+                    key = (lang, hit["title"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    ex = requests.get(api, params={"action": "query", "prop": "extracts", "explaintext": 1,
+                                                   "redirects": 1, "titles": hit["title"], "format": "json"},
+                                      headers=WIKI_UA, timeout=30).json()
+                    page = next(iter(ex["query"]["pages"].values()))
+                    text = (page.get("extract") or "")[:7000]
+                    if len(text) > 500:
+                        pages.append({"title": hit["title"], "text": text,
+                                      "url": f"https://{lang}.wikipedia.org/wiki/" + quote(hit["title"].replace(" ", "_"))})
+            except Exception as e:  # noqa
+                log("wiki error:", e)
+        if len(pages) >= 5:
+            break
+    return pages[:5]
+
+
 def research(videos):
-    """Шаг 1: Gemini с поиском Google находит реальную историю и проверенные факты."""
+    """Шаг 1: находим реальную историю и проверенные факты.
+    Сначала поиск Google через Gemini, если недоступен - статьи Википедии."""
     import prompts
     hist = "\n".join(f"- {v['title']}: {v.get('summary', '')}" for v in videos[-30:]) or "- пока нет"
+    use_search = (ENV("NO_SEARCH") or "").lower() not in ("1", "true", "yes")
     last = ""
     for attempt in range(3):
         focus = random.choice(prompts.FOCUS)
         log(f"поиск истории: {focus}")
-        text, srcs = gemini_search(prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", focus).replace("<<HISTORY>>", hist))
+        text = srcs = None
+        if use_search:
+            try:
+                text, srcs = gemini_search(prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", focus)
+                                           .replace("<<HISTORY>>", hist))
+            except RuntimeError as e:
+                use_search = False
+                log("поиск Google недоступен:", e)
+                notify(f"ℹ️ Поиск Google в Gemini недоступен ({str(e)[:230]}). Беру факты из Википедии.")
+        if text is None:
+            pages = wiki_sources()
+            if not pages:
+                raise RuntimeError("Не удалось получить статьи для проверки фактов")
+            blob = "\n\n".join(f"### {p['title']} ({p['url']})\n{p['text']}" for p in pages)
+            text = gemini(prompts.RESEARCH_FROM_TEXT_PROMPT.replace("<<FOCUS>>", focus)
+                          .replace("<<HISTORY>>", hist).replace("<<SOURCES>>", blob), as_json=False)
+            srcs = [{"title": p["title"], "url": p["url"]} for p in pages]
         last = text[:200]
         if "НЕТ ИСТОРИИ" not in text and "ФАКТЫ" in text and len(text) > 300:
             return text.strip(), srcs
