@@ -47,6 +47,11 @@ VOICE = ENV("TTS_VOICE") or "ru-RU-DmitryNeural"
 # real    - реальные истории про Free Fire (поиск Gemini + проверка фактов), по умолчанию
 # fiction - выдуманные истории
 STORY_TYPE = (ENV("STORY_TYPE") or "real").lower()
+# Tavily - поисковик для ИИ (1000 бесплатных кредитов в месяц): tavily.com
+TAVILY_KEY = ENV("TAVILY_API_KEY", "")
+TAVILY_DEPTH = ENV("TAVILY_DEPTH") or "advanced"   # basic = 1 кредит, advanced = 2 кредита за поиск
+BAD_DOMAINS = ["pinterest.com", "quora.com", "reddit.com", "facebook.com", "instagram.com",
+               "tiktok.com", "x.com", "twitter.com", "vk.com", "t.me"]
 # Эксперимент: герои по референс-картинке (Pollinations kontext) вместо одного текстового описания
 CHAR_REF = (ENV("CHAR_REF") or "").lower() in ("1", "true", "yes")
 REF_MODEL = ENV("REF_MODEL") or "kontext"
@@ -871,29 +876,59 @@ def wiki_sources():
     return pages[:5]
 
 
+def tavily_sources(focus):
+    """Поиск через Tavily: возвращает список {title, url, text}."""
+    queries = [f"Free Fire {focus}"[:380],
+               random.choice(["Free Fire esports true story", "Garena Free Fire tournament history record",
+                              "Free Fire pro player career story"])]
+    pages, seen = [], set()
+    for q in queries:
+        r = requests.post("https://api.tavily.com/search", headers={"Authorization": f"Bearer {TAVILY_KEY}"},
+                          json={"query": q, "search_depth": TAVILY_DEPTH, "max_results": 6,
+                                "exclude_domains": BAD_DOMAINS}, timeout=90)
+        if not r.ok:
+            raise RuntimeError(f"Tavily {r.status_code}: {r.text[:200]}")
+        for x in r.json().get("results", []):
+            url = x.get("url", "")
+            text = (x.get("content") or "")[:3000]
+            if url and url not in seen and len(text) > 200:
+                seen.add(url)
+                pages.append({"title": x.get("title") or url, "url": url, "text": text})
+    return pages[:10]
+
+
 def research(videos):
     """Шаг 1: находим реальную историю и проверенные факты.
-    Сначала поиск Google через Gemini, если недоступен - статьи Википедии."""
+    Источники по очереди: Tavily -> поиск Google в Gemini -> статьи Википедии."""
     import prompts
     hist = "\n".join(f"- {v['title']}: {v.get('summary', '')}" for v in videos[-30:]) or "- пока нет"
+    use_tavily = bool(TAVILY_KEY)
     use_search = (ENV("NO_SEARCH") or "").lower() not in ("1", "true", "yes")
     last = ""
     for attempt in range(3):
         focus = random.choice(prompts.FOCUS)
         log(f"поиск истории: {focus}")
-        text = srcs = None
-        if use_search:
+        pages, text, srcs = [], None, None
+        if use_tavily:
+            try:
+                pages = tavily_sources(focus)
+            except Exception as e:  # noqa
+                use_tavily = False
+                log("Tavily недоступен:", e)
+                notify(f"ℹ️ Tavily недоступен ({str(e)[:200]}). Пробую другой поиск.")
+        if not pages and use_search:
             try:
                 text, srcs = gemini_search(prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", focus)
                                            .replace("<<HISTORY>>", hist))
             except RuntimeError as e:
                 use_search = False
                 log("поиск Google недоступен:", e)
-                notify(f"ℹ️ Поиск Google в Gemini недоступен ({str(e)[:230]}). Беру факты из Википедии.")
+                notify(f"ℹ️ Поиск Google в Gemini недоступен ({str(e)[:200]}). Беру факты из Википедии.")
         if text is None:
-            pages = wiki_sources()
             if not pages:
-                raise RuntimeError("Не удалось получить статьи для проверки фактов")
+                pages = wiki_sources()
+            if not pages:
+                raise RuntimeError("Не удалось получить источники для проверки фактов")
             blob = "\n\n".join(f"### {p['title']} ({p['url']})\n{p['text']}" for p in pages)
             text = gemini(prompts.RESEARCH_FROM_TEXT_PROMPT.replace("<<FOCUS>>", focus)
                           .replace("<<HISTORY>>", hist).replace("<<SOURCES>>", blob), as_json=False)
