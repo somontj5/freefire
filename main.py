@@ -44,6 +44,12 @@ AUTO_PUBLISH = (ENV("AUTO_PUBLISH") or "").lower() in ("1", "true", "yes")
 MODE = (ENV("VIDEO_MODE") or "photo").lower()
 PHOTO_ZOOM = (ENV("PHOTO_ZOOM") or "").lower() in ("1", "true", "yes")  # лёгкий наезд на фото
 VOICE = ENV("TTS_VOICE") or "ru-RU-DmitryNeural"
+# real    - реальные истории про Free Fire (поиск Gemini + проверка фактов), по умолчанию
+# fiction - выдуманные истории
+STORY_TYPE = (ENV("STORY_TYPE") or "real").lower()
+# Эксперимент: герои по референс-картинке (Pollinations kontext) вместо одного текстового описания
+CHAR_REF = (ENV("CHAR_REF") or "").lower() in ("1", "true", "yes")
+REF_MODEL = ENV("REF_MODEL") or "kontext"
 FB = "https://graph.facebook.com/v21.0"
 
 W, H = 1080, 1920
@@ -131,16 +137,12 @@ def notify(text):
 
 # ───────────────────────── Gemini ─────────────────────────
 
-def gemini(prompt, as_json=True):
-    cfg = {"temperature": 1.0}
-    if as_json:
-        cfg["responseMimeType"] = "application/json"
-    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}
+def _gemini_request(body):
     last = None
     for model in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         for attempt in range(3):
-            r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=180)
+            r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=240)
             if r.status_code in (429, 500, 503):
                 last = f"{model}: {r.status_code}"
                 time.sleep(10 * (attempt + 1))
@@ -148,21 +150,51 @@ def gemini(prompt, as_json=True):
             if r.status_code == 404:
                 last = f"{model}: модель не найдена"
                 break
-            r.raise_for_status()
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            if not as_json:
-                return text
-            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-            return json.loads(text)
+            if not r.ok:
+                raise RuntimeError(f"Gemini {model} {r.status_code}: {r.text[:300]}")
+            return r.json()
     raise RuntimeError(f"Gemini недоступен: {last}")
+
+
+def _text_of(resp):
+    parts = resp["candidates"][0]["content"]["parts"]
+    return "".join(p.get("text", "") for p in parts)
+
+
+def gemini(prompt, as_json=True):
+    cfg = {"temperature": 1.0}
+    if as_json:
+        cfg["responseMimeType"] = "application/json"
+    text = _text_of(_gemini_request({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}))
+    if not as_json:
+        return text
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+    return json.loads(text)
+
+
+def gemini_search(prompt):
+    """Ответ Gemini с поиском Google. Возвращает (текст, [источники])."""
+    resp = _gemini_request({"contents": [{"parts": [{"text": prompt}]}],
+                            "tools": [{"google_search": {}}],
+                            "generationConfig": {"temperature": 0.4}})
+    srcs = []
+    meta = resp["candidates"][0].get("groundingMetadata") or {}
+    for ch in meta.get("groundingChunks") or []:
+        w = ch.get("web") or {}
+        if w.get("uri") and not any(x["url"] == w["uri"] for x in srcs):
+            srcs.append({"title": w.get("title", ""), "url": w["uri"]})
+    return _text_of(resp), srcs[:8]
 
 
 # ───────────────────────── картинки ─────────────────────────
 
-def pollinations(prompt, path, seed):
+def pollinations(prompt, path, seed, refs=None):
     from urllib.parse import quote
     url = "https://gen.pollinations.ai/image/" + quote(f"{prompt}, {STYLE}"[:900])
     params = {"width": 1024, "height": 1024, "seed": seed, "nologo": "true", "model": "flux"}
+    if refs:
+        params["model"] = REF_MODEL
+        params["image"] = refs
     headers = {"User-Agent": "video-bot/1.0"}
     if POLL_KEY:
         headers["Authorization"] = f"Bearer {POLL_KEY}"
@@ -219,11 +251,11 @@ def fake_image(kind, key, path):
     im.save(path)
 
 
-def gen_image(kind, prompt, path, seed):
+def gen_image(kind, prompt, path, seed, refs=None):
     if OFFLINE:
         fake_image(kind, prompt, path)
     else:
-        pollinations(prompt, path, seed)
+        pollinations(prompt, path, seed, refs)
 
 
 _session = None
@@ -257,7 +289,7 @@ def load_cast():
     return out
 
 
-def ensure_character(name, desc, cast, portrait=True):
+def ensure_character(name, desc, cast, portrait=True, ref=False):
     """Герой хранится в characters/. Портрет (PNG без фона) нужен только для режима layers."""
     key = name.lower()
     c = cast.get(key)
@@ -276,7 +308,24 @@ def ensure_character(name, desc, cast, portrait=True):
                   raw, c["seed"])
         cutout(raw, c["dir"] / "portrait.png")
         raw.unlink(missing_ok=True)
+    if ref and not (c["dir"] / "ref.png").exists():
+        gen_image("char", f"{c['description']}, full body, standing, front view, plain light background",
+                  c["dir"] / "ref.png", c["seed"])
     return c
+
+
+def ref_urls(text, cast, have_ref):
+    """Ссылки на референсы героев, которые упомянуты в промпте и уже лежат в репозитории."""
+    repo, branch = ENV("GITHUB_REPOSITORY"), ENV("GITHUB_REF_NAME") or "main"
+    out = []
+    for m in re.finditer(r"\[([^\]]+)\]", text):
+        key = m.group(1).strip().lower()
+        c = cast.get(key)
+        if c and key in have_ref and repo:
+            u = f"https://raw.githubusercontent.com/{repo}/{branch}/characters/{c['dir'].name}/ref.png"
+            if u not in out:
+                out.append(u)
+    return out[:2]
 
 
 def expand_prompt(text, cast):
@@ -421,12 +470,22 @@ def story_prompt_photo(videos, cast):
  "scenes": [{{"narration": "...", "image_prompt": "...", "sfx": "none"}}]}}"""
 
 
+def calm(text):
+    """Озвучка не передаёт эмоции: убираем восклицания, многоточия, кавычки и КАПС."""
+    t = str(text).replace("!", ".").replace("…", ".").replace("...", ".")
+    t = re.sub(r"[\"«»“”„]", "", t).replace("—", "-").replace("–", "-")
+    t = re.sub(r"\b([А-ЯЁA-Z]{4,})\b", lambda m: m.group(1).capitalize(), t)
+    t = re.sub(r"\.{2,}", ".", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def validate_photo_story(s):
-    scenes = s.get("scenes") or []
+    scenes = (s.get("scenes") or [])[:45]
+    s["scenes"] = scenes
     if len(scenes) < 4:
         raise RuntimeError("Gemini вернул слишком короткую историю")
     for sc in scenes:
-        sc["narration"] = str(sc.get("narration", "")).strip()
+        sc["narration"] = calm(sc.get("narration", ""))
         sc["image_prompt"] = str(sc.get("image_prompt", "")).strip() or sc["narration"]
         if sc.get("sfx") not in SFX:
             sc["sfx"] = "none"
@@ -548,8 +607,9 @@ def render_scene(tag, sc, bg, chars, prop, voice, photo=False):
     """chars: список (путь, зеркалить?)."""
     from PIL import Image
     vlen = duration(voice)
-    tempo = min(vlen / 2.75, 1.35) if vlen > 2.75 else 1.0
-    d = round(min(max(vlen / tempo + 0.3, 2.0), 3.0), 2)
+    # кадр 2-3 секунды; длинную фразу чуть ускоряем, но речь не обрезаем
+    tempo = min((vlen + 0.3) / 3.0, 1.25) if vlen + 0.3 > 3.0 else 1.0
+    d = round(min(max(vlen / tempo + 0.3, 2.0), 4.5), 2)
 
     cmd, n = [], 0
 
@@ -752,6 +812,27 @@ def publish_video(v, data):
 
 # ───────────────────────── команда create ─────────────────────────
 
+def research(videos):
+    """Шаг 1: Gemini с поиском Google находит реальную историю и проверенные факты."""
+    import prompts
+    hist = "\n".join(f"- {v['title']}: {v.get('summary', '')}" for v in videos[-30:]) or "- пока нет"
+    last = ""
+    for attempt in range(3):
+        focus = random.choice(prompts.FOCUS)
+        log(f"поиск истории: {focus}")
+        text, srcs = gemini_search(prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", focus).replace("<<HISTORY>>", hist))
+        last = text[:200]
+        if "НЕТ ИСТОРИИ" not in text and "ФАКТЫ" in text and len(text) > 300:
+            return text.strip(), srcs
+    raise RuntimeError(f"Не нашёл надёжную историю за 3 попытки: {last}")
+
+
+def build_script_prompt(facts, cast):
+    import prompts
+    heroes = "\n".join(f"- {c['name']}: {c['description']}" for c in cast.values()) or "- пока нет"
+    return prompts.SCRIPT_PROMPT.replace("<<FACTS>>", facts).replace("<<HEROES>>", heroes)
+
+
 def cmd_create():
     WORK.mkdir(exist_ok=True)
     vid = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -760,13 +841,19 @@ def cmd_create():
         videos = load_videos()
         cast = load_cast()
         photo = MODE == "photo"
+        facts, sources = "", []
         if OFFLINE:
             story = SAMPLE_STORY_PHOTO if photo else SAMPLE_STORY
+        elif photo and STORY_TYPE == "real":
+            facts, sources = research(videos)
+            story = gemini(build_script_prompt(facts, cast))
         else:
             story = gemini((story_prompt_photo if photo else story_prompt)(videos, cast))
         story = validate_photo_story(story) if photo else validate_story(story)
+        have_ref = {k for k, c in cast.items() if (c["dir"] / "ref.png").exists()}
         for c in story.get("cast") or []:
-            ensure_character(c["name"], c["description"], cast, portrait=not photo)
+            ensure_character(c["name"], c["description"], cast, portrait=not photo,
+                             ref=photo and CHAR_REF)
         if not photo:
             for c in list(cast.values()):
                 ensure_character(c["name"], c["description"], cast, portrait=True)
@@ -778,8 +865,10 @@ def cmd_create():
             seed = random.Random(f"{vid}{i}").randint(1, 10_000_000)
             if photo:
                 img = WORK / f"{tag}_img.png"
-                gen_image("scene", expand_prompt(sc["image_prompt"], cast) + ", no text, no letters, no watermark",
-                          img, seed)
+                refs = ref_urls(sc["image_prompt"], cast, have_ref) if CHAR_REF else []
+                extra = ", the characters look exactly like in the reference images" if refs else ""
+                gen_image("scene", expand_prompt(sc["image_prompt"], cast) + extra +
+                          ", no text, no letters, no watermark", img, seed, refs or None)
                 voice = WORK / f"{tag}.mp3"
                 make_voice(sc["narration"], voice)
                 parts.append(render_scene(tag, sc, img, [], None, voice, photo=True))
@@ -809,7 +898,8 @@ def cmd_create():
 
     v = {"id": vid, "created": now_iso(), "title": story["title"], "summary": story.get("summary", ""),
          "caption": story.get("caption", story["title"]), "scenes": len(story["scenes"]),
-         "script": [s["narration"] for s in story["scenes"]], "status": "pending"}
+         "script": [s["narration"] for s in story["scenes"]], "status": "pending",
+         "facts": facts[:6000], "sources": sources}
     log(f"готово: {final} ({duration(final):.0f} с)")
 
     if TG_TOKEN and TG_CHAT:
@@ -821,6 +911,9 @@ def cmd_create():
                          {"text": "✅ Опубликовать", "callback_data": f"pub:{vid}"},
                          {"text": "🗑 Отклонить", "callback_data": f"rej:{vid}"}]]})
         v["tg_file_id"] = msg["video"]["file_id"]
+        if sources:
+            lines = "\n".join(f"- {x['title'] or 'источник'}: {x['url']}" for x in sources[:6])
+            notify("Проверь факты перед публикацией. Источники:\n" + lines)
     save_video(v)
 
     if AUTO_PUBLISH and IG_TOKEN:
