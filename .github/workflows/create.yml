@@ -36,12 +36,15 @@ jobs:
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           AUTO_PUBLISH: ${{ vars.AUTO_PUBLISH }}
           VIDEO_MODE: ${{ vars.VIDEO_MODE }}
           PHOTO_ZOOM: ${{ vars.PHOTO_ZOOM }}
           STORY_TYPE: ${{ vars.STORY_TYPE }}
           CHAR_REF: ${{ vars.CHAR_REF }}
           TTS_VOICE: ${{ vars.TTS_VOICE }}
+          TAVILY_DEPTH: ${{ vars.TAVILY_DEPTH }}
+          NO_SEARCH: ${{ vars.NO_SEARCH }}
       - name: Save data (history, heroes)
         if: always()
         run: |
