@@ -39,6 +39,9 @@ jobs:
           AUTO_PUBLISH: ${{ vars.AUTO_PUBLISH }}
           VIDEO_MODE: ${{ vars.VIDEO_MODE }}
           PHOTO_ZOOM: ${{ vars.PHOTO_ZOOM }}
+          STORY_TYPE: ${{ vars.STORY_TYPE }}
+          CHAR_REF: ${{ vars.CHAR_REF }}
+          TTS_VOICE: ${{ vars.TTS_VOICE }}
       - name: Save data (history, heroes)
         if: always()
         run: |
