@@ -41,7 +41,7 @@ POLL_KEY = ENV("POLLINATIONS_KEY", "")
 AUTO_PUBLISH = (ENV("AUTO_PUBLISH") or "").lower() in ("1", "true", "yes")
 # photo  - каждая сцена одно готовое фото (по умолчанию)
 # layers - послойная анимация: фон, герои и предметы отдельно
-MODE = (ENV("VIDEO_MODE") or "photo").lower()
+MODE = (ENV("VIDEO_MODE") or "story").lower()   # story - как в примерах (по умолчанию)
 PHOTO_ZOOM = (ENV("PHOTO_ZOOM") or "").lower() in ("1", "true", "yes")  # лёгкий наезд на фото
 VOICE = ENV("TTS_VOICE") or "ru-RU-DmitryNeural"
 # real    - реальные истории про Free Fire (поиск Gemini + проверка фактов), по умолчанию
@@ -66,7 +66,14 @@ BOX_Y = 300
 SUB_Y = BOX_Y + BOX + 70
 SUB_SIZE = 62
 FPS = 30
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_CANDIDATES = ["/usr/share/fonts/truetype/montserrat/Montserrat-Bold.ttf",
+                   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+FONT = next((f for f in FONT_CANDIDATES if os.path.exists(f)), FONT_CANDIDATES[-1])
+SERIES_CARD = [x.strip() for x in (ENV("SERIES_CARD") or "ИСТОРИЯ|ЗА ОДНУ МИНУТУ").split("|") if x.strip()]
+STYLE_STORY = ("detailed digital comic illustration, semi-realistic, cinematic lighting, rich colors, "
+               "vertical 9:16 composition, no text")
+OVERLAP = 0.3       # длина перехода между кадрами, сек
+RED = "0xE0101A"
 STYLE = "stylized 3D cartoon game art, vibrant colors, clean shapes, battle royale setting"
 
 # SFX генерируются прямо в ffmpeg: (источник, фильтры, задержка в мс)
@@ -217,10 +224,10 @@ def gemini_search(prompt):
 
 # ───────────────────────── картинки ─────────────────────────
 
-def pollinations(prompt, path, seed, refs=None):
+def pollinations(prompt, path, seed, refs=None, size=(1024, 1024), style=None):
     from urllib.parse import quote
-    url = "https://gen.pollinations.ai/image/" + quote(f"{prompt}, {STYLE}"[:900])
-    params = {"width": 1024, "height": 1024, "seed": seed, "nologo": "true", "model": "flux"}
+    url = "https://gen.pollinations.ai/image/" + quote(f"{prompt}, {style or STYLE}"[:900])
+    params = {"width": size[0], "height": size[1], "seed": seed, "nologo": "true", "model": "flux"}
     if refs:
         params["model"] = REF_MODEL
         params["image"] = refs
@@ -246,7 +253,15 @@ def fake_image(kind, key, path):
     from PIL import Image, ImageDraw
     rnd = random.Random(key)
     col = tuple(rnd.randint(60, 220) for _ in range(3))
-    if kind == "scene":
+    if kind == "vscene":
+        im = Image.new("RGB", (1024, 1824))
+        d = ImageDraw.Draw(im)
+        for y in range(1824):
+            d.line([(0, y), (1024, y)], fill=(col[0] - y // 14 % 70, col[1] - y // 20, 90 + y // 12))
+        d.rectangle([0, 1400, 1024, 1824], fill=(40, 70, 50))
+        d.ellipse([380, 520, 640, 780], fill=(240, 200, 160))
+        d.rectangle([330, 780, 690, 1380], fill=tuple(rnd.randint(60, 220) for _ in range(3)))
+    elif kind == "scene":
         im = Image.new("RGB", (1024, 1024))
         d = ImageDraw.Draw(im)
         for y in range(1024):
@@ -284,7 +299,10 @@ def gen_image(kind, prompt, path, seed, refs=None):
     if OFFLINE:
         fake_image(kind, prompt, path)
     else:
-        pollinations(prompt, path, seed, refs)
+        if kind == "vscene":
+            pollinations(prompt, path, seed, refs, size=(1024, 1824), style=STYLE_STORY)
+        else:
+            pollinations(prompt, path, seed, refs)
 
 
 _session = None
@@ -607,7 +625,7 @@ def make_voice(text, path):
     last = None
     for attempt in range(6):
         voice = VOICE if attempt < 4 else "ru-RU-SvetlanaNeural"
-        rate = "+6%" if attempt % 2 == 0 else "+0%"
+        rate = "+8%" if attempt % 2 == 0 else "+0%"
         try:
             asyncio.run(_tts(clean, path, voice, rate))
             if path.exists() and path.stat().st_size > 1000:
@@ -738,6 +756,171 @@ def concat(parts, out):
     lst.write_text("".join(f"file '{p.resolve()}'\n" for p in parts), encoding="utf-8")
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
          "-c", "copy", "-movflags", "+faststart", str(out)])
+
+
+# ───────────────────────── режим story: как в примерах ─────────────────────────
+# Полноэкранные картинки 9:16, слова на экране по одному, плавные переходы, музыка под голосом.
+
+SAMPLE_STORY_SHORTS = {
+    "title": "Вратарь, который изменил футбол",
+    "summary": "История вратаря, ставшего легендой.",
+    "caption": "Он начинал на заводе... #историязаминуту #freefire",
+    "title_line": "ЛЕВ ЯШИН",
+    "cast": [{"name": "Игрок", "description": "tall man with short dark hair in a black goalkeeper jersey and flat cap, 1950s"}],
+    "scenes": [
+        {"narration": "Этот вратарь поймал мяч, который считали невозможным",
+         "image_prompt": "dark silhouette of a goalkeeper in a rainy stadium under floodlights, leather ball on the grass",
+         "accent": ["невозможным"], "sfx": "whoosh"},
+        {"narration": "А начинал он простым рабочим на заводе",
+         "image_prompt": "[Игрок] as a young factory worker among sparks and machines", "accent": ["заводе"]},
+        {"narration": "В 1929 году в Москве родился мальчик",
+         "image_prompt": "old Moscow street, a boy holding a ball", "accent": [],
+         "card": {"lines": ["1929 ГОД", "МОСКВА"], "red": 1}},
+        {"narration": "Тренеры сомневались, но он не сдавался",
+         "image_prompt": "[Игрок] standing before skeptical coaches around a table", "accent": ["сомневались"]},
+        {"narration": "Отправь это другу, который любит футбол",
+         "image_prompt": "[Игрок] raising a hand in a packed stadium at sunset", "accent": ["другу"], "sfx": "hit"},
+    ],
+}
+
+
+def norm_word(w):
+    return re.sub(r"[^\w]", "", w.lower())
+
+
+def validate_story_script(s):
+    s = validate_photo_story(s)
+    s["title_line"] = str(s.get("title_line") or s.get("title", "")).upper()[:40]
+    for sc in s["scenes"]:
+        acc = sc.get("accent") or []
+        sc["accent"] = [norm_word(a) for a in acc if isinstance(a, str) and a.strip()][:3]
+        card = sc.get("card")
+        if isinstance(card, dict) and card.get("lines"):
+            lines = [str(x).upper()[:28] for x in card["lines"][:3]]
+            red = card.get("red")
+            sc["card"] = {"lines": lines, "red": red if isinstance(red, int) and 0 <= red < len(lines) else None}
+        else:
+            sc["card"] = None
+    # карточка рубрики после хука: ИМЯ / ИСТОРИЯ / ЗА ОДНУ МИНУТУ (последняя строка красная)
+    idx = min(3, len(s["scenes"]) - 1)
+    if s["title_line"] and not s["scenes"][idx].get("card"):
+        lines = [s["title_line"]] + SERIES_CARD
+        s["scenes"][idx]["card"] = {"lines": lines[:3], "red": len(lines[:3]) - 1}
+    return s
+
+
+def words_timeline(text, d, accent):
+    """Время показа каждого слова: пропорционально длине слова (озвучка не отдаёт точные метки)."""
+    words = [w for w in (re.sub(r"[.,;:?!«»\"“”]", "", x) for x in text.split()) if w]
+    if not words:
+        return []
+    weights = [len(w) + 2 for w in words]
+    lead, tail = 0.05, 0.10
+    span = max(d - lead - tail, 0.5)
+    tot, t, out = sum(weights), lead, []
+    for w, wt in zip(words, weights):
+        dur = span * wt / tot
+        nw = norm_word(w)
+        hot = any(nw == a or (len(nw) >= 5 and len(a) >= 5 and nw[:5] == a[:5]) for a in accent)
+        out.append([w, t, t + dur, hot])
+        t += dur
+    out[-1][2] = d + OVERLAP + 0.5      # последнее слово держится до конца кадра
+    return out
+
+
+def _drawtext(txtfile, size, color, y_expr, enable, border=5):
+    return (f"drawtext=fontfile={FONT}:textfile={txtfile}:expansion=none:fontsize={size}:fontcolor={color}:"
+            f"borderw={border}:bordercolor=black@0.85:shadowx=2:shadowy=3:shadowcolor=black@0.55:"
+            f"x=(w-text_w)/2:y={y_expr}:enable='{enable}'")
+
+
+def render_clip(tag, sc, img, d):
+    """Видео-кадр: картинка на весь экран с плавным движением, слова по одному, карточка сверху."""
+    total = d + OVERLAP
+    frames = int(total * FPS) + 2
+    rnd = random.Random(tag)
+    kind = rnd.choice(["in", "in", "out", "pan_l", "pan_r"])
+    if kind == "in":
+        z, x, y = f"1+0.10*on/{frames}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    elif kind == "out":
+        z, x, y = f"1.10-0.10*on/{frames}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    elif kind == "pan_l":
+        z, x, y = "1.08", f"(iw-iw/zoom)*(0.85-0.7*on/{frames})", "ih/2-(ih/zoom/2)"
+    else:
+        z, x, y = "1.08", f"(iw-iw/zoom)*(0.15+0.7*on/{frames})", "ih/2-(ih/zoom/2)"
+    vf = [f"scale=2160:3840,zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS}"]
+
+    for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []))):
+        f = WORK / f"{tag}_w{i}.txt"
+        f.write_text(w, encoding="utf-8")
+        vf.append(_drawtext(f, 66, RED if hot else "white", "h*0.63-text_h/2", f"between(t,{a:.2f},{b:.2f})"))
+    card = sc.get("card")
+    if card:
+        for i, line in enumerate(card["lines"]):
+            f = WORK / f"{tag}_c{i}.txt"
+            f.write_text(line, encoding="utf-8")
+            vf.append(_drawtext(f, 92, RED if card["red"] == i else "white", f"h*0.10+{i * 110}", "gte(t,0)", 6))
+    out = WORK / f"{tag}_clip.mp4"
+    run(["ffmpeg", "-y", "-i", str(img), "-vf", ",".join(vf) + ",format=yuv420p", "-t", f"{total:.2f}",
+         "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-an", str(out)])
+    return out
+
+
+def scene_audio(tag, sc, voice, d):
+    """Озвучка (точно d секунд) + SFX, стерео 44.1 кГц."""
+    sfx = SFX.get(sc.get("sfx", "none"))
+    cmd = ["ffmpeg", "-y", "-i", str(voice)]
+    fc = [f"[0:a]aformat=sample_rates=44100:channel_layouts=stereo,apad,atrim=0:{d:.2f}[v]"]
+    if sfx:
+        cmd += ["-f", "lavfi", "-t", "1.5", "-i", sfx[0]]
+        fc.append(f"[1:a]{sfx[1]},aformat=sample_rates=44100:channel_layouts=stereo,adelay={sfx[2]}|{sfx[2]}[x]")
+        fc.append("[v][x]amix=inputs=2:duration=first:dropout_transition=0,volume=2[a]")
+    else:
+        fc.append("[v]anull[a]")
+    out = WORK / f"{tag}_aud.wav"
+    run(cmd + ["-filter_complex", ";".join(fc), "-map", "[a]", "-ar", "44100", "-ac", "2", str(out)])
+    return out
+
+
+def music_input(total):
+    """Музыка под голосом: свой файл из папки music/ или спокойный синтезированный фон."""
+    mus = sorted((ROOT / "music").glob("*.mp3")) if (ROOT / "music").exists() else []
+    if mus:
+        return ["-stream_loop", "-1", "-i", str(random.choice(mus))]
+    expr = ("(0.30*sin(2*PI*110*t)+0.22*sin(2*PI*164.8*t)+0.18*sin(2*PI*220.5*t)+0.12*sin(2*PI*329.6*t))"
+            "*(0.75+0.25*sin(2*PI*0.12*t))")
+    return ["-f", "lavfi", "-t", f"{total:.1f}", "-i", f"aevalsrc='{expr}':s=44100:c=stereo"]
+
+
+def assemble(clips, audios, durs, out):
+    n = len(clips)
+    total_audio = sum(durs)
+    total = total_audio + OVERLAP
+    vlist = WORK / "voice_list.txt"
+    vlist.write_text("".join(f"file '{p.resolve()}'\n" for p in audios), encoding="utf-8")
+    voice = WORK / "voice_all.wav"
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(vlist), "-c", "copy", str(voice)])
+
+    trans = ["fade", "fade", "dissolve", "zoomin", "smoothleft", "smoothright"]
+    rnd = random.Random(n)
+    fc, prev, off = [], "0:v", 0.0
+    for k in range(1, n):
+        off += durs[k - 1]
+        fc.append(f"[{prev}][{k}:v]xfade=transition={rnd.choice(trans)}:duration={OVERLAP}:offset={off:.2f}[x{k}]")
+        prev = f"x{k}"
+    cmd = ["ffmpeg", "-y"]
+    for c in clips:
+        cmd += ["-i", str(c)]
+    cmd += ["-i", str(voice)] + music_input(total)
+    iv, im = n, n + 1
+    fc.append(f"[{iv}:a]apad=pad_dur={OVERLAP + 0.5}[vo]")
+    fc.append(f"[{im}:a]volume=0.16,afade=t=in:d=1.5,afade=t=out:st={max(total - 2, 0):.1f}:d=2[mu]")
+    fc.append("[vo][mu]amix=inputs=2:duration=first:dropout_transition=0,volume=2,"
+              "loudnorm=I=-14:TP=-1.5:LRA=9[a]")
+    vmap = f"[{prev}]" if n > 1 else "[0:v]"
+    run(cmd + ["-filter_complex", ";".join(fc), "-map", vmap, "-map", "[a]", "-t", f"{total:.2f}",
+               "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out)])
 
 
 # ───────────────────────── Instagram ─────────────────────────
@@ -942,7 +1125,8 @@ def research(videos):
 def build_script_prompt(facts, cast):
     import prompts
     heroes = "\n".join(f"- {c['name']}: {c['description']}" for c in cast.values()) or "- пока нет"
-    return prompts.SCRIPT_PROMPT.replace("<<FACTS>>", facts).replace("<<HEROES>>", heroes)
+    tpl = prompts.SCRIPT_PROMPT_STORY if MODE == "story" else prompts.SCRIPT_PROMPT
+    return tpl.replace("<<FACTS>>", facts).replace("<<HEROES>>", heroes)
 
 
 def cmd_create():
@@ -952,16 +1136,18 @@ def cmd_create():
         refresh_stats()
         videos = load_videos()
         cast = load_cast()
-        photo = MODE == "photo"
+        story_mode = MODE == "story"
+        photo = MODE in ("photo", "story")
         facts, sources = "", []
         if OFFLINE:
-            story = SAMPLE_STORY_PHOTO if photo else SAMPLE_STORY
+            story = SAMPLE_STORY_SHORTS if story_mode else (SAMPLE_STORY_PHOTO if photo else SAMPLE_STORY)
         elif photo and STORY_TYPE == "real":
             facts, sources = research(videos)
             story = gemini(build_script_prompt(facts, cast))
         else:
             story = gemini((story_prompt_photo if photo else story_prompt)(videos, cast))
-        story = validate_photo_story(story) if photo else validate_story(story)
+        story = (validate_story_script(story) if story_mode else
+                 validate_photo_story(story) if photo else validate_story(story))
         have_ref = {k for k, c in cast.items() if (c["dir"] / "ref.png").exists()}
         for c in story.get("cast") or []:
             ensure_character(c["name"], c["description"], cast, portrait=not photo,
@@ -970,11 +1156,24 @@ def cmd_create():
             for c in list(cast.values()):
                 ensure_character(c["name"], c["description"], cast, portrait=True)
 
-        parts = []
+        parts, clips, audios, durs = [], [], [], []
         for i, sc in enumerate(story["scenes"]):
             tag = f"s{i:02d}"
             log(f"сцена {i + 1}/{len(story['scenes'])}: {sc['narration']}")
             seed = random.Random(f"{vid}{i}").randint(1, 10_000_000)
+            if story_mode:
+                img = WORK / f"{tag}_img.png"
+                refs = ref_urls(sc["image_prompt"], cast, have_ref) if CHAR_REF else []
+                extra = ", the characters look exactly like in the reference images" if refs else ""
+                gen_image("vscene", expand_prompt(sc["image_prompt"], cast) + extra +
+                          ", no text, no letters, no watermark", img, seed, refs or None)
+                voice = WORK / f"{tag}.mp3"
+                make_voice(sc["narration"], voice)
+                d = round(max(1.8, duration(voice) + 0.12), 2)
+                clips.append(render_clip(tag, sc, img, d))
+                audios.append(scene_audio(tag, sc, voice, d))
+                durs.append(d)
+                continue
             if photo:
                 img = WORK / f"{tag}_img.png"
                 refs = ref_urls(sc["image_prompt"], cast, have_ref) if CHAR_REF else []
@@ -1003,14 +1202,17 @@ def cmd_create():
             parts.append(render_scene(tag, sc, bg, layers, prop, voice))
 
         final = WORK / "final.mp4"
-        concat(parts, final)
+        if story_mode:
+            assemble(clips, audios, durs, final)
+        else:
+            concat(parts, final)
     except Exception as e:
         notify(f"❌ Не удалось собрать ролик: {e}")
         raise
 
     v = {"id": vid, "created": now_iso(), "title": story["title"], "summary": story.get("summary", ""),
          "caption": story.get("caption", story["title"]), "scenes": len(story["scenes"]),
-         "script": [s["narration"] for s in story["scenes"]], "status": "pending",
+         "script": [s["narration"] for s in story["scenes"]], "status": "pending", "mode": MODE,
          "facts": facts[:6000], "sources": sources}
     log(f"готово: {final} ({duration(final):.0f} с)")
 
