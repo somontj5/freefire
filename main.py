@@ -1152,7 +1152,8 @@ def assemble(clips, audios, durs, out):
               "loudnorm=I=-14:TP=-1.5:LRA=9[a]")
     vmap = f"[{prev}]" if n > 1 else "[0:v]"
     run(cmd + ["-filter_complex", ";".join(fc), "-map", vmap, "-map", "[a]", "-t", f"{total:.2f}",
-               "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+               "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-maxrate", "5M",
+               "-bufsize", "10M", "-pix_fmt", "yuv420p",
                "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out)])
 
 
@@ -1253,6 +1254,41 @@ def publish_video(v, data):
     v["published"] = now_iso()
     save_video(v)
     return media_id
+
+
+TG_LIMIT_MB = 45     # Telegram принимает файлы бота до 50 МБ
+
+
+def video_for_telegram(final):
+    """Если ролик тяжелее лимита Telegram, делаем лёгкую копию для просмотра."""
+    if final.stat().st_size <= TG_LIMIT_MB * 1024 * 1024:
+        return final
+    kbps = max(int(TG_LIMIT_MB * 0.85 * 1024 * 8 / duration(final)) - 128, 500)
+    out = WORK / "preview.mp4"
+    run(["ffmpeg", "-y", "-i", str(final), "-vf", "scale=720:1280", "-c:v", "libx264", "-preset", "veryfast",
+         "-b:v", f"{kbps}k", "-maxrate", f"{int(kbps * 1.3)}k", "-bufsize", f"{kbps * 2}k",
+         "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(out)])
+    return out
+
+
+def upload_release(vid, title, path):
+    """Полная версия ролика кладётся во Releases репозитория: оттуда её берёт публикация в Instagram
+    (через Telegram бот может скачать только файлы до 20 МБ)."""
+    repo, tok = ENV("GITHUB_REPOSITORY"), ENV("GITHUB_TOKEN")
+    if not (repo and tok):
+        return None
+    h = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
+    r = requests.post(f"https://api.github.com/repos/{repo}/releases", headers=h, timeout=60,
+                      json={"tag_name": f"video-{vid}", "name": title[:100], "prerelease": True,
+                            "body": "Автоматически созданный ролик"})
+    if not r.ok:
+        raise RuntimeError(f"release: {r.status_code} {r.text[:200]}")
+    with open(path, "rb") as f:
+        up = requests.post(r.json()["upload_url"].split("{")[0] + "?name=video.mp4",
+                           headers={**h, "Content-Type": "video/mp4"}, data=f, timeout=1800)
+    if not up.ok:
+        raise RuntimeError(f"upload: {up.status_code} {up.text[:200]}")
+    return up.json()["browser_download_url"]
 
 
 # ───────────────────────── команда create ─────────────────────────
@@ -1464,8 +1500,14 @@ def cmd_create():
          "facts": facts[:6000], "sources": sources}
     log(f"готово: {final} ({duration(final):.0f} с)")
 
+    try:
+        v["video_url"] = upload_release(vid, v["title"], final)
+    except Exception as e:  # noqa
+        log("не удалось сохранить полную версию:", e)
+        notify(f"⚠️ Не смог сохранить полную версию ролика на GitHub ({str(e)[:160]}). "
+               "Публикация в Instagram возможна только для файлов до 20 МБ.")
     if TG_TOKEN and TG_CHAT:
-        with open(final, "rb") as f:
+        with open(video_for_telegram(final), "rb") as f:
             msg = tg("sendVideo", files={"video": f}, chat_id=TG_CHAT, width=W, height=H,
                      supports_streaming="true",
                      caption=f"🎬 {v['title']}\n\n{v['caption']}"[:1000],
@@ -1565,8 +1607,11 @@ def handle_callback(cq):
     tg_safe("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": []})
     tg_safe("sendMessage", chat_id=chat, text=f"⏳ Публикую в Instagram: {v['title']}")
     try:
-        info = tg("getFile", file_id=v["tg_file_id"])
-        data = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{info['file_path']}", timeout=300).content
+        if v.get("video_url"):
+            data = requests.get(v["video_url"], timeout=900).content
+        else:
+            info = tg("getFile", file_id=v["tg_file_id"])
+            data = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{info['file_path']}", timeout=300).content
         publish_video(v, data)
         tg_safe("sendMessage", chat_id=chat, text=f"✅ Опубликовано в Instagram: {v['title']}")
     except Exception as e:
