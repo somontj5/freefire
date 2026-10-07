@@ -38,6 +38,13 @@ TG_CHAT = ENV("TG_CHAT_ID", "")
 IG_USER = ENV("IG_USER_ID", "")
 IG_TOKEN = ENV("IG_ACCESS_TOKEN", "")
 POLL_KEY = ENV("POLLINATIONS_KEY", "")
+# Генерация картинок: hf - Hugging Face Space (FLUX), pollinations, auto - сначала HF, при сбое Pollinations
+HF_TOKEN = ENV("HF_TOKEN", "")
+# Бесплатные Spaces Hugging Face по очереди: сначала качественный dev, при исчерпании GPU-лимита schnell
+HF_SPACES = list(dict.fromkeys(x for x in [ENV("HF_SPACE"), "black-forest-labs/FLUX.1-dev",
+                                           "black-forest-labs/FLUX.1-schnell"] if x))
+HF_STEPS = ENV("HF_STEPS", "")
+IMAGE_PROVIDER = (ENV("IMAGE_PROVIDER") or ("auto" if ENV("HF_TOKEN") else "pollinations")).lower()
 AUTO_PUBLISH = (ENV("AUTO_PUBLISH") or "").lower() in ("1", "true", "yes")
 # photo  - каждая сцена одно готовое фото (по умолчанию)
 # layers - послойная анимация: фон, герои и предметы отдельно
@@ -72,7 +79,7 @@ FONT = next((f for f in FONT_CANDIDATES if os.path.exists(f)), FONT_CANDIDATES[-
 SERIES_CARD = [x.strip() for x in (ENV("SERIES_CARD") or "ИСТОРИЯ|ЗА ОДНУ МИНУТУ").split("|") if x.strip()]
 STYLE_STORY = ("detailed digital comic illustration, semi-realistic, cinematic lighting, rich colors, "
                "vertical 9:16 composition, no text")
-OVERLAP = 0.3       # длина перехода между кадрами, сек
+OVERLAP = 0.25      # длина перехода между кадрами, сек
 RED = "0xE0101A"
 STYLE = "stylized 3D cartoon game art, vibrant colors, clean shapes, battle royale setting"
 
@@ -295,14 +302,82 @@ def fake_image(kind, key, path):
     im.save(path)
 
 
+class HFQuota(RuntimeError):
+    pass
+
+
+_hf = {"clients": {}, "dead": set()}
+
+
+def hf_generate(prompt, path, seed, size, space):
+    """Картинка из бесплатного Hugging Face Space (FLUX) через gradio_client."""
+    from gradio_client import Client
+    if space not in _hf["clients"]:
+        try:
+            _hf["clients"][space] = Client(space, hf_token=HF_TOKEN or None)
+        except TypeError:
+            _hf["clients"][space] = Client(space, token=HF_TOKEN or None)
+    c = _hf["clients"][space]
+    names = set()
+    try:
+        names = {p["parameter_name"] for p in c.view_api(return_format="dict")["named_endpoints"]["/infer"]["parameters"]}
+    except Exception:  # noqa
+        pass
+    cand = {"prompt": prompt, "seed": int(seed) % 2147483647, "randomize_seed": False,
+            "width": size[0], "height": size[1]}
+    if HF_STEPS:
+        cand["num_inference_steps"] = int(HF_STEPS)
+    kwargs = {k: v for k, v in cand.items() if not names or k in names}
+    last = None
+    for attempt in range(3):
+        try:
+            res = c.predict(api_name="/infer", **kwargs)
+            img = res[0] if isinstance(res, (list, tuple)) else res
+            if isinstance(img, dict):
+                img = img.get("path") or img.get("url")
+            from PIL import Image
+            Image.open(img).convert("RGB").save(path)
+            return
+        except Exception as e:  # noqa
+            last = e
+            if "quota" in str(e).lower():
+                raise HFQuota(str(e)[:300])
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"HF: {str(last)[:300]}")
+
+
 def gen_image(kind, prompt, path, seed, refs=None):
     if OFFLINE:
         fake_image(kind, prompt, path)
-    else:
-        if kind == "vscene":
-            pollinations(prompt, path, seed, refs, size=(1024, 1824), style=STYLE_STORY)
-        else:
-            pollinations(prompt, path, seed, refs)
+        return
+    vertical = kind == "vscene"
+    use_hf = IMAGE_PROVIDER in ("hf", "auto") and not refs      # референсы умеет только Pollinations
+    use_poll = IMAGE_PROVIDER in ("pollinations", "auto") or bool(refs)
+    errors = []
+    if use_hf:
+        for space in HF_SPACES:
+            if space in _hf["dead"]:
+                continue
+            try:
+                hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
+                            (768, 1344) if vertical else (1024, 1024), space)
+                return
+            except HFQuota as e:
+                _hf["dead"].add(space)
+                errors.append(f"{space}: квота")
+                notify(f"ℹ️ Лимит GPU на Hugging Face для {space.split('/')[-1]} исчерпан: {str(e)[:160]}")
+            except Exception as e:  # noqa
+                errors.append(f"{space}: {str(e)[:160]}")
+    if use_poll:
+        try:
+            if vertical:
+                pollinations(prompt, path, seed, refs, size=(1024, 1824), style=STYLE_STORY)
+            else:
+                pollinations(prompt, path, seed, refs)
+            return
+        except Exception as e:  # noqa
+            errors.append(f"pollinations: {str(e)[:160]}")
+    raise RuntimeError("Не удалось нарисовать картинку: " + " | ".join(errors))
 
 
 _session = None
@@ -615,20 +690,33 @@ async def _tts(text, path, voice, rate):
     await edge_tts.Communicate(text, voice, rate=rate).save(str(path))
 
 
+def trim_silence(path):
+    """Срезает тишину в начале и конце фразы, чтобы между предложениями не было длинных пауз."""
+    tmp = pathlib.Path(str(path) + ".trim.wav")
+    run(["ffmpeg", "-y", "-i", str(path), "-af",
+         "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.03,areverse,"
+         "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,areverse",
+         "-f", "wav", str(tmp)])
+    if tmp.exists() and tmp.stat().st_size > 2000:
+        tmp.replace(path)
+
+
 def make_voice(text, path):
     if OFFLINE:
         run(["ffmpeg", "-y", "-f", "lavfi", "-i",
              f"sine=f=220:d={0.38 * len(text.split()):.2f}", str(path)])
+        trim_silence(path)
         return
     # edge-tts иногда не отдаёт звук (лимиты Microsoft): повторяем, меняем скорость и голос
     clean = re.sub(r"[\"«»“”„]", "", text).strip() or "..."
     last = None
     for attempt in range(6):
         voice = VOICE if attempt < 4 else "ru-RU-SvetlanaNeural"
-        rate = "+8%" if attempt % 2 == 0 else "+0%"
+        rate = "+12%" if attempt % 2 == 0 else "+0%"
         try:
             asyncio.run(_tts(clean, path, voice, rate))
             if path.exists() and path.stat().st_size > 1000:
+                trim_silence(path)
                 time.sleep(0.7)
                 return
             last = "пустой файл"
@@ -772,7 +860,8 @@ SAMPLE_STORY_SHORTS = {
          "image_prompt": "dark silhouette of a goalkeeper in a rainy stadium under floodlights, leather ball on the grass",
          "accent": ["невозможным"], "sfx": "whoosh"},
         {"narration": "А начинал он простым рабочим на заводе",
-         "image_prompt": "[Игрок] as a young factory worker among sparks and machines", "accent": ["заводе"]},
+         "image_prompt": "[Игрок] as a young factory worker among sparks and machines", "accent": ["заводе"],
+         "flashback": True},
         {"narration": "В 1929 году в Москве родился мальчик",
          "image_prompt": "old Moscow street, a boy holding a ball", "accent": [],
          "card": {"lines": ["1929 ГОД", "МОСКВА"], "red": 1}},
@@ -794,6 +883,7 @@ def validate_story_script(s):
     for sc in s["scenes"]:
         acc = sc.get("accent") or []
         sc["accent"] = [norm_word(a) for a in acc if isinstance(a, str) and a.strip()][:3]
+        sc["flashback"] = bool(sc.get("flashback"))
         card = sc.get("card")
         if isinstance(card, dict) and card.get("lines"):
             lines = [str(x).upper()[:28] for x in card["lines"][:3]]
@@ -828,8 +918,9 @@ def words_timeline(text, d, accent):
     return out
 
 
-def _drawtext(txtfile, size, color, y_expr, enable, border=5):
-    return (f"drawtext=fontfile={FONT}:textfile={txtfile}:expansion=none:fontsize={size}:fontcolor={color}:"
+def _drawtext(txtfile, size, color, y_expr, enable, border=5, pop_at=None):
+    fs = f"'{size}*(1+0.35*max(0,1-(t-{pop_at:.2f})/0.14))'" if pop_at is not None else size
+    return (f"drawtext=fontfile={FONT}:textfile={txtfile}:expansion=none:fontsize={fs}:fontcolor={color}:"
             f"borderw={border}:bordercolor=black@0.85:shadowx=2:shadowy=3:shadowcolor=black@0.55:"
             f"x=(w-text_w)/2:y={y_expr}:enable='{enable}'")
 
@@ -849,11 +940,16 @@ def render_clip(tag, sc, img, d):
     else:
         z, x, y = "1.08", f"(iw-iw/zoom)*(0.15+0.7*on/{frames})", "ih/2-(ih/zoom/2)"
     vf = [f"scale=2160:3840,zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS}"]
+    if sc.get("flashback"):      # сцены из прошлого: чёрно-белые с зерном
+        vf.append("hue=s=0,eq=contrast=1.25:brightness=-0.03,noise=alls=14:allf=t")
+    if sc.get("sfx") in ("hit", "boom", "shot"):   # вспышка на ударе
+        vf.append("format=yuv420p,fade=t=in:st=0:d=0.10:color=white")
 
     for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []))):
         f = WORK / f"{tag}_w{i}.txt"
         f.write_text(w, encoding="utf-8")
-        vf.append(_drawtext(f, 66, RED if hot else "white", "h*0.63-text_h/2", f"between(t,{a:.2f},{b:.2f})"))
+        vf.append(_drawtext(f, 66, RED if hot else "white", "h*0.63-text_h/2",
+                            f"between(t,{a:.2f},{b:.2f})", pop_at=a))
     card = sc.get("card")
     if card:
         for i, line in enumerate(card["lines"]):
@@ -901,7 +997,8 @@ def assemble(clips, audios, durs, out):
     voice = WORK / "voice_all.wav"
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(vlist), "-c", "copy", str(voice)])
 
-    trans = ["fade", "fade", "dissolve", "zoomin", "smoothleft", "smoothright"]
+    trans = ["fade", "zoomin", "slideleft", "slideright", "wipeleft", "wiperight", "circleopen",
+             "radial", "pixelize", "distance", "vuslice", "fadefast"]
     rnd = random.Random(n)
     fc, prev, off = [], "0:v", 0.0
     for k in range(1, n):
@@ -1169,7 +1266,7 @@ def cmd_create():
                           ", no text, no letters, no watermark", img, seed, refs or None)
                 voice = WORK / f"{tag}.mp3"
                 make_voice(sc["narration"], voice)
-                d = round(max(1.8, duration(voice) + 0.12), 2)
+                d = round(max(1.4, duration(voice) + 0.06), 2)
                 clips.append(render_clip(tag, sc, img, d))
                 audios.append(scene_audio(tag, sc, voice, d))
                 durs.append(d)
