@@ -42,7 +42,11 @@ POLL_KEY = ENV("POLLINATIONS_KEY", "")
 HF_TOKEN = ENV("HF_TOKEN", "")
 # Бесплатные Spaces Hugging Face по очереди: сначала качественный dev, при исчерпании GPU-лимита schnell
 HF_SPACES = list(dict.fromkeys(x for x in [ENV("HF_SPACE"), "black-forest-labs/FLUX.1-dev",
-                                           "black-forest-labs/FLUX.1-schnell"] if x))
+                                           "black-forest-labs/FLUX.1-schnell",
+                                           "Tongyi-MAI/Z-Image-Turbo"] if x))
+# InstantID: картинка по лицу героя (герой везде узнаваем). Тратит много GPU-времени, поэтому выключен по умолчанию.
+INSTANTID = (ENV("INSTANTID") or "").lower() in ("1", "true", "yes")
+INSTANTID_SPACE = ENV("INSTANTID_SPACE") or "InstantX/InstantID"
 HF_STEPS = ENV("HF_STEPS", "")
 IMAGE_PROVIDER = (ENV("IMAGE_PROVIDER") or ("auto" if ENV("HF_TOKEN") else "pollinations")).lower()
 AUTO_PUBLISH = (ENV("AUTO_PUBLISH") or "").lower() in ("1", "true", "yes")
@@ -309,8 +313,77 @@ class HFQuota(RuntimeError):
 _hf = {"clients": {}, "dead": set()}
 
 
-def hf_generate(prompt, path, seed, size, space):
-    """Картинка из бесплатного Hugging Face Space (FLUX) через gradio_client."""
+def _walk_paths(obj):
+    """Все строки-пути/ссылки на картинки внутри ответа Space (он бывает списком, словарём, галереей)."""
+    if isinstance(obj, str):
+        if re.search(r"\.(png|jpe?g|webp)(\?.*)?$", obj, re.I) or obj.startswith("/tmp") or obj.startswith("/var"):
+            yield obj
+    elif isinstance(obj, dict):
+        for k in ("path", "image", "url", "value"):
+            if k in obj:
+                yield from _walk_paths(obj[k])
+    elif isinstance(obj, (list, tuple)):
+        for x in obj:
+            yield from _walk_paths(x)
+
+
+def _space_kwargs(params, prompt, seed, size, face):
+    """Подбирает аргументы Space по именам его параметров: у разных Spaces они немного отличаются."""
+    from gradio_client import handle_file
+    kw, face_used = {}, False
+    for p in params:
+        name, low = p["parameter_name"], p["parameter_name"].lower()
+        comp = str(p.get("component", "")).lower()
+        has_def = p.get("parameter_has_default", False)
+        if "negative" in low:
+            kw[name] = "text, watermark, letters, deformed, blurry, low quality"
+        elif low == "prompt" or low.endswith("prompt"):
+            kw[name] = prompt
+        elif "random" in low:
+            kw[name] = False
+        elif "seed" in low:
+            kw[name] = int(seed) % 2147483647
+        elif low == "width":
+            kw[name] = size[0]
+        elif low == "height":
+            kw[name] = size[1]
+        elif "resolution" in low:
+            enum = (p.get("type") or {}).get("enum") or []
+            pick = next((e for e in enum if any(t in str(e) for t in ("9:16", "768x1344", "720x1280", "1344"))
+                         and "16:9" not in str(e)), None)
+            if pick:
+                kw[name] = pick
+        elif low in ("steps", "num_inference_steps") and HF_STEPS:
+            kw[name] = int(HF_STEPS)
+        elif comp in ("image", "file", "gallery") or "image" in low or "file" in low:
+            if face and not face_used and "pose" not in low and "mask" not in low:
+                kw[name] = handle_file(str(face))
+                face_used = True
+            elif not has_def:
+                kw[name] = None
+        elif not has_def:
+            kw[name] = None
+    return kw
+
+
+def fit_vertical(path):
+    """Обрезает картинку по центру до 9:16 (если Space отдал квадрат)."""
+    from PIL import Image
+    im = Image.open(path)
+    w, h = im.size
+    want = 9 / 16
+    if abs(w / h - want) > 0.02:
+        if w / h > want:
+            nw = int(h * want)
+            im = im.crop(((w - nw) // 2, 0, (w - nw) // 2 + nw, h))
+        else:
+            nh = int(w / want)
+            im = im.crop((0, (h - nh) // 2, w, (h - nh) // 2 + nh))
+    im.convert("RGB").save(path)
+
+
+def hf_generate(prompt, path, seed, size, space, face=None):
+    """Картинка из бесплатного Hugging Face Space через gradio_client (FLUX, Z-Image-Turbo, InstantID)."""
     from gradio_client import Client
     if space not in _hf["clients"]:
         try:
@@ -318,35 +391,34 @@ def hf_generate(prompt, path, seed, size, space):
         except TypeError:
             _hf["clients"][space] = Client(space, token=HF_TOKEN or None)
     c = _hf["clients"][space]
-    names = set()
-    try:
-        names = {p["parameter_name"] for p in c.view_api(return_format="dict")["named_endpoints"]["/infer"]["parameters"]}
-    except Exception:  # noqa
-        pass
-    cand = {"prompt": prompt, "seed": int(seed) % 2147483647, "randomize_seed": False,
-            "width": size[0], "height": size[1]}
-    if HF_STEPS:
-        cand["num_inference_steps"] = int(HF_STEPS)
-    kwargs = {k: v for k, v in cand.items() if not names or k in names}
+    api = c.view_api(return_format="dict")["named_endpoints"]
+    ep = next((e for e in ("/infer", "/generate", "/generate_image", "/predict") if e in api), None)
+    if ep is None:
+        ep = next((e for e, v in api.items() if any("prompt" in p["parameter_name"].lower() for p in v["parameters"])), None)
+    if ep is None:
+        raise RuntimeError(f"в Space {space} не нашёл метод генерации")
+    kwargs = _space_kwargs(api[ep]["parameters"], prompt, seed, size, face)
     last = None
     for attempt in range(3):
         try:
-            res = c.predict(api_name="/infer", **kwargs)
-            img = res[0] if isinstance(res, (list, tuple)) else res
-            if isinstance(img, dict):
-                img = img.get("path") or img.get("url")
+            res = c.predict(api_name=ep, **kwargs)
+            found = next((p for p in _walk_paths(res) if pathlib.Path(p).exists()), None)
+            if not found:
+                raise RuntimeError(f"Space не вернул картинку: {str(res)[:160]}")
             from PIL import Image
-            Image.open(img).convert("RGB").save(path)
+            Image.open(found).convert("RGB").save(path)
+            if size[1] > size[0]:
+                fit_vertical(path)
             return
         except Exception as e:  # noqa
             last = e
             if "quota" in str(e).lower():
                 raise HFQuota(str(e)[:300])
             time.sleep(5 * (attempt + 1))
-    raise RuntimeError(f"HF: {str(last)[:300]}")
+    raise RuntimeError(f"HF {space}: {str(last)[:300]}")
 
 
-def gen_image(kind, prompt, path, seed, refs=None):
+def gen_image(kind, prompt, path, seed, refs=None, face=None):
     if OFFLINE:
         fake_image(kind, prompt, path)
         return
@@ -354,6 +426,16 @@ def gen_image(kind, prompt, path, seed, refs=None):
     use_hf = IMAGE_PROVIDER in ("hf", "auto") and not refs      # референсы умеет только Pollinations
     use_poll = IMAGE_PROVIDER in ("pollinations", "auto") or bool(refs)
     errors = []
+    if face and INSTANTID and IMAGE_PROVIDER in ("hf", "auto") and INSTANTID_SPACE not in _hf["dead"]:
+        try:       # картинка по лицу героя
+            hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
+                        (768, 1344) if vertical else (1024, 1024), INSTANTID_SPACE, face=face)
+            return
+        except HFQuota as e:
+            _hf["dead"].add(INSTANTID_SPACE)
+            notify(f"ℹ️ Лимит GPU для InstantID исчерпан, рисую без привязки к лицу: {str(e)[:140]}")
+        except Exception as e:  # noqa
+            errors.append(f"InstantID: {str(e)[:160]}")
     if use_hf:
         for space in HF_SPACES:
             if space in _hf["dead"]:
@@ -411,7 +493,7 @@ def load_cast():
     return out
 
 
-def ensure_character(name, desc, cast, portrait=True, ref=False):
+def ensure_character(name, desc, cast, portrait=True, ref=False, face=False):
     """Герой хранится в characters/. Портрет (PNG без фона) нужен только для режима layers."""
     key = name.lower()
     c = cast.get(key)
@@ -433,6 +515,9 @@ def ensure_character(name, desc, cast, portrait=True, ref=False):
     if ref and not (c["dir"] / "ref.png").exists():
         gen_image("char", f"{c['description']}, full body, standing, front view, plain light background",
                   c["dir"] / "ref.png", c["seed"])
+    if face and not (c["dir"] / "face.png").exists():
+        gen_image("scene", f"{c['description']}, close-up portrait, face centered, looking at the camera, "
+                  "plain simple background, sharp clear face", c["dir"] / "face.png", c["seed"])
     return c
 
 
@@ -729,7 +814,7 @@ def make_voice(text, path):
 
 def subtitle_filters(text, tag):
     parts = []
-    for i, line in enumerate(textwrap.wrap(text, width=24)):
+    for i, line in enumerate(wrap_px(text, SUB_SIZE, BOX * 0.96)):
         f = WORK / f"{tag}_sub{i}.txt"
         f.write_text(line, encoding="utf-8")
         y = SUB_Y + i * (SUB_SIZE + 18)
@@ -918,6 +1003,55 @@ def words_timeline(text, d, accent):
     return out
 
 
+_font_cache = {}
+
+
+def text_w(text, size):
+    """Ширина текста в пикселях тем же шрифтом, которым его рисует ffmpeg."""
+    from PIL import ImageFont
+    f = _font_cache.get(size)
+    if f is None:
+        f = _font_cache[size] = ImageFont.truetype(FONT, int(size))
+    return f.getlength(text)
+
+
+def fit_size(text, size, max_w, min_size=36):
+    """Уменьшает шрифт, пока текст не влезет по ширине (с запасом на обводку)."""
+    while size > min_size and text_w(text, size) + 14 > max_w:
+        size -= 2
+    return size
+
+
+def wrap_px(text, size, max_w):
+    """Перенос строк по реальной ширине в пикселях."""
+    lines, cur = [], ""
+    for w in text.split():
+        trial = (cur + " " + w).strip()
+        if cur and text_w(trial, size) + 14 > max_w:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    return lines + ([cur] if cur else [])
+
+
+def card_layout(lines, red, size=92, max_w=None, min_size=60):
+    """Строки карточки: каждая вписана в ширину, слишком длинная делится на две."""
+    max_w = max_w or W * 0.92
+    out = []
+    for i, ln in enumerate(lines):
+        sz = fit_size(ln, size, max_w, min_size)
+        parts = [ln]
+        if text_w(ln, sz) + 14 > max_w and " " in ln:
+            words = ln.split()
+            k = min(range(1, len(words)),
+                    key=lambda k: max(text_w(" ".join(words[:k]), sz), text_w(" ".join(words[k:]), sz)))
+            parts = [" ".join(words[:k]), " ".join(words[k:])]
+        for part in parts:
+            out.append((part, fit_size(part, size, max_w, 36), red == i))
+    return out
+
+
 def _drawtext(txtfile, size, color, y_expr, enable, border=5, pop_at=None):
     fs = f"'{size}*(1+0.35*max(0,1-(t-{pop_at:.2f})/0.14))'" if pop_at is not None else size
     return (f"drawtext=fontfile={FONT}:textfile={txtfile}:expansion=none:fontsize={fs}:fontcolor={color}:"
@@ -948,14 +1082,16 @@ def render_clip(tag, sc, img, d):
     for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []))):
         f = WORK / f"{tag}_w{i}.txt"
         f.write_text(w, encoding="utf-8")
-        vf.append(_drawtext(f, 66, RED if hot else "white", "h*0.63-text_h/2",
-                            f"between(t,{a:.2f},{b:.2f})", pop_at=a))
+        vf.append(_drawtext(f, fit_size(w, 66, W * 0.94 / 1.35, 34), RED if hot else "white",
+                            "h*0.63-text_h/2", f"between(t,{a:.2f},{b:.2f})", pop_at=a))
     card = sc.get("card")
     if card:
-        for i, line in enumerate(card["lines"]):
+        y = int(H * 0.09)
+        for i, (line, size, is_red) in enumerate(card_layout(card["lines"], card["red"])):
             f = WORK / f"{tag}_c{i}.txt"
             f.write_text(line, encoding="utf-8")
-            vf.append(_drawtext(f, 92, RED if card["red"] == i else "white", f"h*0.10+{i * 110}", "gte(t,0)", 6))
+            vf.append(_drawtext(f, size, RED if is_red else "white", str(y), "gte(t,0)", 6))
+            y += int(size * 1.22)
     out = WORK / f"{tag}_clip.mp4"
     run(["ffmpeg", "-y", "-i", str(img), "-vf", ",".join(vf) + ",format=yuv420p", "-t", f"{total:.2f}",
          "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-an", str(out)])
@@ -1122,8 +1258,8 @@ def publish_video(v, data):
 # ───────────────────────── команда create ─────────────────────────
 
 WIKI_UA = {"User-Agent": "video-bot/1.0 (educational project)"}
-WIKI_QUERIES = ["Garena Free Fire", "Free Fire World Series", "Free Fire Pro League",
-                "Free Fire esports", "Garena", "Free Fire Continental Series"]
+WIKI_QUERIES = ["Free Fire professional player", "Free Fire YouTuber", "Free Fire streamer",
+                "Garena founder", "Free Fire esports player", "Free Fire team captain"]
 
 
 def wiki_sources():
@@ -1159,8 +1295,9 @@ def wiki_sources():
 def tavily_sources(focus):
     """Поиск через Tavily: возвращает список {title, url, text}."""
     queries = [f"Free Fire {focus}"[:380],
-               random.choice(["Free Fire esports true story", "Garena Free Fire tournament history record",
-                              "Free Fire pro player career story"])]
+               random.choice(["Free Fire pro player biography how he started", "Free Fire streamer success story interview",
+                              "Garena Free Fire esports player career path story",
+                              "Free Fire content creator how he became famous"])]
     pages, seen = [], set()
     for q in queries:
         r = requests.post("https://api.tavily.com/search", headers={"Authorization": f"Bearer {TAVILY_KEY}"},
@@ -1182,6 +1319,8 @@ def research(videos):
     Источники по очереди: Tavily -> поиск Google в Gemini -> статьи Википедии."""
     import prompts
     hist = "\n".join(f"- {v['title']}: {v.get('summary', '')}" for v in videos[-30:]) or "- пока нет"
+    people = [str(v.get("person") or "").strip() for v in videos if v.get("person")]
+    people_txt = "\n".join(f"- {x}" for x in people) or "- пока нет"
     use_tavily = bool(TAVILY_KEY)
     use_search = (ENV("NO_SEARCH") or "").lower() not in ("1", "true", "yes")
     last = ""
@@ -1199,7 +1338,7 @@ def research(videos):
         if not pages and use_search:
             try:
                 text, srcs = gemini_search(prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", focus)
-                                           .replace("<<HISTORY>>", hist))
+                                           .replace("<<HISTORY>>", hist).replace("<<PEOPLE>>", people_txt))
             except RuntimeError as e:
                 use_search = False
                 log("поиск Google недоступен:", e)
@@ -1211,9 +1350,14 @@ def research(videos):
                 raise RuntimeError("Не удалось получить источники для проверки фактов")
             blob = "\n\n".join(f"### {p['title']} ({p['url']})\n{p['text']}" for p in pages)
             text = gemini(prompts.RESEARCH_FROM_TEXT_PROMPT.replace("<<FOCUS>>", focus)
-                          .replace("<<HISTORY>>", hist).replace("<<SOURCES>>", blob), as_json=False)
+                          .replace("<<HISTORY>>", hist).replace("<<PEOPLE>>", people_txt)
+                          .replace("<<SOURCES>>", blob), as_json=False)
             srcs = [{"title": p["title"], "url": p["url"]} for p in pages]
         last = text[:200]
+        hero = (re.search(r"ГЕРОЙ:\s*(.+)", text) or [None, ""])[1].lower()
+        if hero and any(norm_word(x)[:6] and norm_word(x)[:6] in norm_word(hero) for x in people):
+            log(f"герой уже был ({hero}), ищу другого")
+            continue
         if "НЕТ ИСТОРИИ" not in text and "ФАКТЫ" in text and len(text) > 300:
             return text.strip(), srcs
     raise RuntimeError(f"Не нашёл надёжную историю за 3 попытки: {last}")
@@ -1248,7 +1392,7 @@ def cmd_create():
         have_ref = {k for k, c in cast.items() if (c["dir"] / "ref.png").exists()}
         for c in story.get("cast") or []:
             ensure_character(c["name"], c["description"], cast, portrait=not photo,
-                             ref=photo and CHAR_REF)
+                             ref=photo and CHAR_REF, face=story_mode and INSTANTID)
         if not photo:
             for c in list(cast.values()):
                 ensure_character(c["name"], c["description"], cast, portrait=True)
@@ -1262,8 +1406,15 @@ def cmd_create():
                 img = WORK / f"{tag}_img.png"
                 refs = ref_urls(sc["image_prompt"], cast, have_ref) if CHAR_REF else []
                 extra = ", the characters look exactly like in the reference images" if refs else ""
+                face = None
+                if INSTANTID:
+                    for nm in re.findall(r"\[([^\]]+)\]", sc["image_prompt"]):
+                        c0 = cast.get(nm.strip().lower())
+                        if c0 and (c0["dir"] / "face.png").exists():
+                            face = c0["dir"] / "face.png"
+                            break
                 gen_image("vscene", expand_prompt(sc["image_prompt"], cast) + extra +
-                          ", no text, no letters, no watermark", img, seed, refs or None)
+                          ", no text, no letters, no watermark", img, seed, refs or None, face=face)
                 voice = WORK / f"{tag}.mp3"
                 make_voice(sc["narration"], voice)
                 d = round(max(1.4, duration(voice) + 0.06), 2)
@@ -1307,7 +1458,7 @@ def cmd_create():
         notify(f"❌ Не удалось собрать ролик: {e}")
         raise
 
-    v = {"id": vid, "created": now_iso(), "title": story["title"], "summary": story.get("summary", ""),
+    v = {"id": vid, "created": now_iso(), "title": story["title"], "person": story.get("title_line", ""), "summary": story.get("summary", ""),
          "caption": story.get("caption", story["title"]), "scenes": len(story["scenes"]),
          "script": [s["narration"] for s in story["scenes"]], "status": "pending", "mode": MODE,
          "facts": facts[:6000], "sources": sources}
@@ -1377,6 +1528,16 @@ def handle_message(m):
         tg("sendMessage", chat_id=chat, text=f"Всего: {len(vs)}, ждут решения: {pend}, опубликовано: {pub}")
 
 
+def tg_safe(method, **params):
+    """Служебные вызовы (ответ на нажатие, смена кнопок) не должны ронять обработчик.
+    Типичные безвредные ошибки: «query is too old» (бот опрашивает раз в минуту) и «message is not modified»."""
+    try:
+        return tg(method, **params)
+    except Exception as e:  # noqa
+        log(f"{method}: {str(e)[:160]}")
+        return None
+
+
 def handle_callback(cq):
     chat = str(cq["message"]["chat"]["id"])
     if str(TG_CHAT) != chat:
@@ -1385,23 +1546,34 @@ def handle_callback(cq):
     v = get_video(vid)
     qid = cq["id"]
     mid = cq["message"]["message_id"]
+    buttons = {"inline_keyboard": [[{"text": "✅ Опубликовать", "callback_data": f"pub:{vid}"},
+                                    {"text": "🗑 Отклонить", "callback_data": f"rej:{vid}"}]]}
     if not v or v["status"] != "pending":
-        tg("answerCallbackQuery", callback_query_id=qid, text="Уже обработано")
+        tg_safe("answerCallbackQuery", callback_query_id=qid, text="Уже обработано")
+        tg_safe("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": []})
         return
-    tg("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": []})
     if action == "rej":
         v["status"] = "rejected"
         save_video(v)
-        tg("answerCallbackQuery", callback_query_id=qid, text="Отклонено")
+        tg_safe("answerCallbackQuery", callback_query_id=qid, text="Отклонено")
+        tg_safe("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": []})
         return
-    tg("answerCallbackQuery", callback_query_id=qid, text="Публикую...")
+    # публикация: сразу помечаем, чтобы повторное нажатие не опубликовало дважды
+    v["status"] = "publishing"
+    save_video(v)
+    tg_safe("answerCallbackQuery", callback_query_id=qid, text="Публикую...")
+    tg_safe("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup={"inline_keyboard": []})
+    tg_safe("sendMessage", chat_id=chat, text=f"⏳ Публикую в Instagram: {v['title']}")
     try:
         info = tg("getFile", file_id=v["tg_file_id"])
         data = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{info['file_path']}", timeout=300).content
         publish_video(v, data)
-        tg("sendMessage", chat_id=chat, text=f"✅ Опубликовано в Instagram: {v['title']}")
+        tg_safe("sendMessage", chat_id=chat, text=f"✅ Опубликовано в Instagram: {v['title']}")
     except Exception as e:
-        tg("sendMessage", chat_id=chat, text=f"❌ Не получилось опубликовать: {e}"[:4000])
+        v["status"] = "pending"          # можно нажать кнопку ещё раз
+        save_video(v)
+        tg_safe("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup=buttons)
+        tg_safe("sendMessage", chat_id=chat, text=f"❌ Не получилось опубликовать: {e}"[:4000])
 
 
 def cmd_poll():
