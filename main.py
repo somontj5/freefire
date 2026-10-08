@@ -43,9 +43,15 @@ POLL_KEY = ENV("POLLINATIONS_KEY", "")
 # Генерация картинок: hf - Hugging Face Space (FLUX), pollinations, auto - сначала HF, при сбое Pollinations
 HF_TOKEN = ENV("HF_TOKEN", "")
 # Бесплатные Spaces Hugging Face по очереди: сначала качественный dev, при исчерпании GPU-лимита schnell
-HF_SPACES = list(dict.fromkeys(x for x in [ENV("HF_SPACE"), "black-forest-labs/FLUX.1-dev",
-                                           "black-forest-labs/FLUX.1-schnell",
-                                           "Tongyi-MAI/Z-Image-Turbo"] if x))
+HF_SPACES = list(dict.fromkeys(x for x in [ENV("HF_SPACE"), "black-forest-labs/FLUX.2-klein-9B",
+                                           "Tongyi-MAI/Z-Image-Turbo", "black-forest-labs/FLUX.1-schnell",
+                                           "black-forest-labs/FLUX.1-dev"] if x))
+# Картинка из картинки (герой по образцу): Space на FLUX.1-schnell
+IMG2IMG_SPACE = ENV("IMG2IMG_SPACE") or "Akjava/flux1-schnell-img2img"
+IMG2IMG_STRENGTH = float(ENV("IMG2IMG_STRENGTH") or 0.7)
+# AI Horde - бесплатная сеть GPU без дневной квоты (медленнее, качество проще). Ключ не нужен.
+HORDE_KEY = ENV("HORDE_API_KEY") or "0000000000"
+HORDE_BUDGET = int(ENV("HORDE_BUDGET") or 1500)      # сколько секунд за запуск готовы ждать Horde
 # InstantID: картинка по лицу героя (герой везде узнаваем). Тратит много GPU-времени, поэтому выключен по умолчанию.
 INSTANTID = (ENV("INSTANTID") or "").lower() in ("1", "true", "yes")
 INSTANTID_SPACE = ENV("INSTANTID_SPACE") or "InstantX/InstantID"
@@ -80,7 +86,7 @@ TAVILY_DEPTH = ENV("TAVILY_DEPTH") or "advanced"   # basic = 1 кредит, adv
 BAD_DOMAINS = ["pinterest.com", "quora.com", "reddit.com", "facebook.com", "instagram.com",
                "tiktok.com", "x.com", "twitter.com", "vk.com", "t.me"]
 # Эксперимент: герои по референс-картинке (Pollinations kontext) вместо одного текстового описания
-CHAR_REF = (ENV("CHAR_REF") or "").lower() in ("1", "true", "yes")
+CHAR_REF = (ENV("CHAR_REF") or "true").lower() in ("1", "true", "yes")   # по умолчанию включено, выключить: false
 REF_MODEL = ENV("REF_MODEL") or "kontext"
 # Токен из «Instagram API с входом через Instagram» начинается с IG, из входа через Facebook - с EAA.
 FB = ("https://graph.instagram.com/v21.0" if IG_TOKEN.startswith("IG")
@@ -362,7 +368,7 @@ class PollDead(RuntimeError):
     pass
 
 
-_hf = {"clients": {}, "dead": set(), "poll_dead": False}
+_hf = {"clients": {}, "dead": set(), "poll_dead": False, "horde_dead": False, "horde_spent": 0.0, "fails": {}}
 
 
 def _walk_paths(obj):
@@ -407,6 +413,8 @@ def _space_kwargs(params, prompt, seed, size, face):
                 kw[name] = pick
         elif low in ("steps", "num_inference_steps") and HF_STEPS:
             kw[name] = int(HF_STEPS)
+        elif face and ("strength" in low or "denois" in low):
+            kw[name] = IMG2IMG_STRENGTH
         elif comp in ("image", "file", "gallery") or "image" in low or "file" in low:
             if face and not face_used and "pose" not in low and "mask" not in low:
                 kw[name] = handle_file(str(face))
@@ -432,6 +440,48 @@ def fit_vertical(path):
             nh = int(w / want)
             im = im.crop((0, (h - nh) // 2, w, (h - nh) // 2 + nh))
     im.convert("RGB").save(path)
+
+
+def horde_generate(prompt, path, seed, size):
+    """Картинка через AI Horde (анонимный ключ). Очередь может занять минуты."""
+    import base64
+    import io
+    from PIL import Image
+    base = "https://aihorde.net/api/v2"
+    h = {"apikey": HORDE_KEY, "Client-Agent": "video-bot:1.0:github", "Content-Type": "application/json"}
+    vertical = size[1] > size[0]
+    body = {"prompt": f"{prompt} ### text, letters, watermark, deformed, blurry, low quality",
+            "params": {"width": 448 if vertical else 512, "height": 768 if vertical else 512, "steps": 25,
+                       "n": 1, "cfg_scale": 7, "sampler_name": "k_euler_a", "seed": str(int(seed) % 2147483647)},
+            "nsfw": False, "censor_nsfw": True}
+    t0 = time.time()
+    try:
+        r = requests.post(f"{base}/generate/async", headers=h, json=body, timeout=60)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Horde {r.status_code}: {r.text[:200]}")
+        jid = r.json()["id"]
+        while True:
+            if time.time() - t0 > 240:
+                requests.delete(f"{base}/generate/status/{jid}", headers=h, timeout=30)
+                raise RuntimeError("Horde: очередь слишком долгая")
+            c = requests.get(f"{base}/generate/check/{jid}", headers=h, timeout=30).json()
+            if c.get("faulted"):
+                raise RuntimeError("Horde: сбой генерации")
+            if c.get("done"):
+                break
+            time.sleep(4)
+        gens = requests.get(f"{base}/generate/status/{jid}", headers=h, timeout=60).json().get("generations") or []
+        if not gens:
+            raise RuntimeError("Horde: пустой ответ")
+        img = gens[0]["img"]
+        data = requests.get(img, timeout=120).content if str(img).startswith("http") else base64.b64decode(img)
+        Image.open(io.BytesIO(data)).convert("RGB").save(path)
+        if vertical:
+            fit_vertical(path)
+    finally:
+        _hf["horde_spent"] += time.time() - t0
+        if _hf["horde_spent"] > HORDE_BUDGET:
+            _hf["horde_dead"] = True
 
 
 def ensure_gradio():
@@ -461,7 +511,7 @@ def hf_generate(prompt, path, seed, size, space, face=None):
         raise RuntimeError(f"в Space {space} не нашёл метод генерации")
     kwargs = _space_kwargs(api[ep]["parameters"], prompt, seed, size, face)
     last = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             res = c.predict(api_name=ep, **kwargs)
             found = next((p for p in _walk_paths(res) if pathlib.Path(p).exists()), None)
@@ -471,23 +521,38 @@ def hf_generate(prompt, path, seed, size, space, face=None):
             Image.open(found).convert("RGB").save(path)
             if size[1] > size[0]:
                 fit_vertical(path)
+            _hf["fails"][space] = 0
             return
         except Exception as e:  # noqa
             last = e
             if "quota" in str(e).lower():
                 raise HFQuota(str(e)[:300])
             time.sleep(5 * (attempt + 1))
+    _hf["fails"][space] = _hf["fails"].get(space, 0) + 1
+    if _hf["fails"][space] >= 2:
+        _hf["dead"].add(space)
     raise RuntimeError(f"HF {space}: {str(last)[:300]}")
 
 
-def gen_image(kind, prompt, path, seed, refs=None, face=None):
+def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None):
     if OFFLINE:
         fake_image(kind, prompt, path)
         return
     vertical = kind == "vscene"
     use_hf = IMAGE_PROVIDER in ("hf", "auto") and not refs      # референсы умеет только Pollinations
     use_poll = IMAGE_PROVIDER in ("pollinations", "auto") or bool(refs)
+    use_horde = IMAGE_PROVIDER in ("horde", "auto") and not refs
     errors = []
+    if init and CHAR_REF and IMAGE_PROVIDER in ("hf", "auto") and IMG2IMG_SPACE not in _hf["dead"]:
+        try:       # новая сцена по образцу героя: одежда и внешность сохраняются
+            hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
+                        (768, 1344) if vertical else (1024, 1024), IMG2IMG_SPACE, face=init)
+            return
+        except HFQuota as e:
+            _hf["dead"].add(IMG2IMG_SPACE)
+            notify(f"ℹ️ Лимит GPU для режима «по образцу» исчерпан, рисую без образца: {str(e)[:120]}")
+        except Exception as e:  # noqa
+            errors.append(f"img2img: {str(e)[:140]}")
     if face and INSTANTID and IMAGE_PROVIDER in ("hf", "auto") and INSTANTID_SPACE not in _hf["dead"]:
         try:       # картинка по лицу героя
             hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
@@ -525,7 +590,14 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None):
             notify(f"ℹ️ Pollinations недоступен ({str(e)[:140]}). Дальше рисую только через Hugging Face.")
         except Exception as e:  # noqa
             errors.append(f"pollinations: {str(e)[:160]}")
-    raise RuntimeError("Не удалось нарисовать картинку: " + " | ".join(errors))
+    if use_horde and not _hf["horde_dead"]:
+        try:
+            horde_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
+                           (768, 1344) if vertical else (1024, 1024))
+            return
+        except Exception as e:  # noqa
+            errors.append(f"horde: {str(e)[:140]}")
+    raise RuntimeError("Не удалось нарисовать картинку: " + (" | ".join(errors) or "лимиты всех сервисов исчерпаны"))
 
 
 _session = None
@@ -745,6 +817,7 @@ def story_prompt_photo(videos, cast):
 
 def calm(text):
     """Озвучка не передаёт эмоции: убираем восклицания, многоточия, кавычки и КАПС."""
+    text = re.sub(r"[^0-9A-Za-zА-Яа-яЁё\s.,?!:;%/+&'\"«»“”„…—–()\-]", "", str(text))   # хинди, иероглифы и т.п.
     t = str(text).replace("!", ".").replace("…", ".").replace("...", ".")
     t = re.sub(r"[\"«»“”„]", "", t).replace("—", "-").replace("–", "-")
     t = re.sub(r"\b([А-ЯЁA-Z]{4,})\b", lambda m: m.group(1).capitalize(), t)
@@ -1694,6 +1767,11 @@ def cmd_create():
         if not photo:
             for c in list(cast.values()):
                 ensure_character(c["name"], c["description"], cast, portrait=True)
+        elif CHAR_REF:
+            used = {n.strip().lower() for sc in story["scenes"] for n in re.findall(r"\[([^\]]+)\]", sc["image_prompt"])}
+            for key in used:
+                if key in cast:
+                    ensure_character(cast[key]["name"], cast[key]["description"], cast, portrait=False, ref=True)
 
         parts, clips, audios, durs = [], [], [], []
         voices = make_all_voices(story["scenes"]) if story_mode else None
@@ -1704,8 +1782,15 @@ def cmd_create():
             seed = random.Random(f"{vid}{i}").randint(1, 10_000_000)
             if story_mode:
                 img = WORK / f"{tag}_img.png"
-                refs = ref_urls(sc["image_prompt"], cast, have_ref) if CHAR_REF else []
+                refs = ref_urls(sc["image_prompt"], cast, have_ref) if (CHAR_REF and IMAGE_PROVIDER == "pollinations") else []
                 extra = ", the characters look exactly like in the reference images" if refs else ""
+                init_ref = None
+                if CHAR_REF:
+                    for nm in re.findall(r"\[([^\]]+)\]", sc["image_prompt"]):
+                        c0 = cast.get(nm.strip().lower())
+                        if c0 and (c0["dir"] / "ref.png").exists():
+                            init_ref = c0["dir"] / "ref.png"
+                            break
                 face = None
                 if INSTANTID:
                     for nm in re.findall(r"\[([^\]]+)\]", sc["image_prompt"]):
@@ -1715,9 +1800,9 @@ def cmd_create():
                             break
                 try:
                     gen_image("vscene", expand_prompt(sc["image_prompt"], cast) + extra +
-                              ", no text, no letters, no watermark", img, seed, refs or None, face=face)
+                              ", no text, no letters, no watermark", img, seed, refs or None, face=face, init=init_ref)
                 except RuntimeError as e:
-                    if last_img is None or img_fail >= 4:
+                    if last_img is None or img_fail > max(4, int(len(story["scenes"]) * 0.4)):
                         raise
                     img_fail += 1
                     log(f"картинка сцены {i + 1} не получилась, беру предыдущую: {str(e)[:120]}")
@@ -1735,7 +1820,7 @@ def cmd_create():
                 continue
             if photo:
                 img = WORK / f"{tag}_img.png"
-                refs = ref_urls(sc["image_prompt"], cast, have_ref) if CHAR_REF else []
+                refs = ref_urls(sc["image_prompt"], cast, have_ref) if (CHAR_REF and IMAGE_PROVIDER == "pollinations") else []
                 extra = ", the characters look exactly like in the reference images" if refs else ""
                 gen_image("scene", expand_prompt(sc["image_prompt"], cast) + extra +
                           ", no text, no letters, no watermark", img, seed, refs or None)
