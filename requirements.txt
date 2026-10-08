@@ -3,3 +3,4 @@ edge-tts
 rembg
 onnxruntime
 pillow
+gradio_client
