@@ -434,8 +434,18 @@ def fit_vertical(path):
     im.convert("RGB").save(path)
 
 
+def ensure_gradio():
+    """Если библиотека не установлена (старый requirements.txt в репозитории), ставит её сама."""
+    try:
+        import gradio_client  # noqa: F401
+    except ImportError:
+        log("ставлю gradio_client...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gradio_client"], check=True)
+
+
 def hf_generate(prompt, path, seed, size, space, face=None):
     """Картинка из бесплатного Hugging Face Space через gradio_client (FLUX, Z-Image-Turbo, InstantID)."""
+    ensure_gradio()
     from gradio_client import Client
     if space not in _hf["clients"]:
         try:
@@ -941,7 +951,7 @@ def make_all_voices(scenes):
     chunks, cur, size = [], [], 0
     for i, ph in enumerate(phrases):
         b = len(ph.encode("utf-8")) + 1
-        if cur and size + b > 3400:
+        if cur and size + b > 3800:
             chunks.append(cur)
             cur, size = [], 0
         cur.append(i)
