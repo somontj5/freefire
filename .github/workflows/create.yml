@@ -39,6 +39,12 @@ jobs:
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           PUTER_AUTH_TOKEN: ${{ secrets.PUTER_AUTH_TOKEN }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN1: ${{ secrets.HF_TOKEN1 }}
+          HF_TOKEN2: ${{ secrets.HF_TOKEN2 }}
+          HF_TOKEN3: ${{ secrets.HF_TOKEN3 }}
+          HF_TOKEN4: ${{ secrets.HF_TOKEN4 }}
+          HF_TOKEN5: ${{ secrets.HF_TOKEN5 }}
+          HF_TOKEN6: ${{ secrets.HF_TOKEN6 }}
           AUTO_PUBLISH: ${{ vars.AUTO_PUBLISH }}
           VIDEO_MODE: ${{ vars.VIDEO_MODE }}
           PHOTO_ZOOM: ${{ vars.PHOTO_ZOOM }}
