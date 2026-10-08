@@ -48,6 +48,7 @@ jobs:
           TTS_PROVIDER: ${{ vars.TTS_PROVIDER }}
           SCRIPT_WRITER: ${{ vars.SCRIPT_WRITER }}
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          GEMINI_SCRIPT_MODEL: ${{ vars.GEMINI_SCRIPT_MODEL }}
           GEMINI_VOICE: ${{ vars.GEMINI_VOICE }}
           GEMINI_TTS_MODEL: ${{ vars.GEMINI_TTS_MODEL }}
           TAVILY_DEPTH: ${{ vars.TAVILY_DEPTH }}
