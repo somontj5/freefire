@@ -33,6 +33,8 @@ CHARS = (WORK / "chars_offline") if OFFLINE else (ROOT / "characters")
 
 GEMINI_KEY = ENV("GEMINI_API_KEY", "")
 GEMINI_MODELS = [m for m in [ENV("GEMINI_MODEL"), "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"] if m]
+# Для сценария можно взять модель посильнее (один запрос на ролик): например GEMINI_SCRIPT_MODEL=gemini-3.5-flash
+GEMINI_SCRIPT_MODELS = [m for m in [ENV("GEMINI_SCRIPT_MODEL")] if m]
 TG_TOKEN = ENV("TG_TOKEN", "")
 TG_CHAT = ENV("TG_CHAT_ID", "")
 IG_USER = ENV("IG_USER_ID", "")
@@ -48,7 +50,7 @@ HF_SPACES = list(dict.fromkeys(x for x in [ENV("HF_SPACE"), "black-forest-labs/F
 INSTANTID = (ENV("INSTANTID") or "").lower() in ("1", "true", "yes")
 INSTANTID_SPACE = ENV("INSTANTID_SPACE") or "InstantX/InstantID"
 HF_STEPS = ENV("HF_STEPS", "")
-IMAGE_PROVIDER = (ENV("IMAGE_PROVIDER") or ("auto" if ENV("HF_TOKEN") else "pollinations")).lower()
+IMAGE_PROVIDER = (ENV("IMAGE_PROVIDER") or "auto").lower()
 AUTO_PUBLISH = (ENV("AUTO_PUBLISH") or "").lower() in ("1", "true", "yes")
 # photo  - каждая сцена одно готовое фото (по умолчанию)
 # layers - послойная анимация: фон, герои и предметы отдельно
@@ -193,9 +195,9 @@ def _retry_delay(r):
     return None
 
 
-def _gemini_request(body, patient=True):
+def _gemini_request(body, patient=True, models=None):
     errors = []
-    for model in GEMINI_MODELS:
+    for model in list(dict.fromkeys((models or []) + GEMINI_MODELS)):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         for attempt in range(3 if patient else 1):
             r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=240)
@@ -222,11 +224,12 @@ def _text_of(resp):
     return "".join(p.get("text", "") for p in parts)
 
 
-def gemini(prompt, as_json=True):
+def gemini(prompt, as_json=True, models=None):
     cfg = {"temperature": 1.0}
     if as_json:
         cfg["responseMimeType"] = "application/json"
-    text = _text_of(_gemini_request({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}))
+    text = _text_of(_gemini_request({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg},
+                                    models=models))
     if not as_json:
         return text
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
@@ -292,6 +295,8 @@ def pollinations(prompt, path, seed, refs=None, size=(1024, 1024), style=None):
     for attempt in range(5):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=180)
+            if r.status_code in (401, 402, 403):     # нет баланса или ключ не принят - повторы бесполезны
+                raise PollDead(f"{r.status_code} {r.text[:140]}")
             if r.ok and r.headers.get("content-type", "").startswith("image"):
                 path.write_bytes(r.content)
                 time.sleep(2)
@@ -353,7 +358,11 @@ class HFQuota(RuntimeError):
     pass
 
 
-_hf = {"clients": {}, "dead": set()}
+class PollDead(RuntimeError):
+    pass
+
+
+_hf = {"clients": {}, "dead": set(), "poll_dead": False}
 
 
 def _walk_paths(obj):
@@ -493,13 +502,17 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None):
                 notify(f"ℹ️ Лимит GPU на Hugging Face для {space.split('/')[-1]} исчерпан: {str(e)[:160]}")
             except Exception as e:  # noqa
                 errors.append(f"{space}: {str(e)[:160]}")
-    if use_poll:
+    if use_poll and not _hf["poll_dead"]:
         try:
             if vertical:
                 pollinations(prompt, path, seed, refs, size=(1024, 1824), style=STYLE_STORY)
             else:
                 pollinations(prompt, path, seed, refs)
             return
+        except PollDead as e:
+            _hf["poll_dead"] = True
+            errors.append(f"pollinations: {str(e)[:120]}")
+            notify(f"ℹ️ Pollinations недоступен ({str(e)[:140]}). Дальше рисую только через Hugging Face.")
         except Exception as e:  # noqa
             errors.append(f"pollinations: {str(e)[:160]}")
     raise RuntimeError("Не удалось нарисовать картинку: " + " | ".join(errors))
@@ -1149,7 +1162,13 @@ def norm_word(w):
     return re.sub(r"[^\w]", "", w.lower())
 
 
+def looks_like_card(text):
+    t = str(text).upper()
+    return "/" in t or ("ИСТОРИЯ" in t and "МИНУТ" in t)
+
+
 def validate_story_script(s):
+    s["scenes"] = [sc for sc in (s.get("scenes") or []) if not looks_like_card(sc.get("narration", ""))]
     s = validate_photo_story(s)
     s["title_line"] = str(s.get("title_line") or s.get("title", "")).upper()[:40]
     for sc in s["scenes"]:
@@ -1357,7 +1376,7 @@ def ig_publish(video_bytes, caption):
         "caption": caption[:2200], "access_token": IG_TOKEN}, timeout=60)
     j = r.json()
     if "id" not in j:
-        raise RuntimeError(f"Instagram создание контейнера: {j}")
+        raise RuntimeError(f"Instagram создание контейнера: {j}. Отправь боту /igtest, он покажет причину.")
     cid = j["id"]
     up = requests.post(f"https://rupload.facebook.com/ig-api-upload/v21.0/{cid}", data=video_bytes, headers={
         "Authorization": f"OAuth {IG_TOKEN}", "offset": "0", "file_size": str(len(video_bytes))}, timeout=600)
@@ -1379,6 +1398,39 @@ def ig_publish(video_bytes, caption):
     if "id" not in pub:
         raise RuntimeError(f"Instagram публикация: {pub}")
     return pub["id"]
+
+
+def ig_diagnose():
+    """Проверка подключения Instagram: что именно блокирует публикацию. Результат приходит в Telegram."""
+    if not (IG_USER and IG_TOKEN):
+        return "Instagram не настроен: нет IG_USER_ID или IG_ACCESS_TOKEN."
+    kind = ("вход через Instagram (токен IG...)" if IG_TOKEN.startswith("IG")
+            else "вход через Facebook (токен EAA...)" if IG_TOKEN.startswith("EAA") else "неизвестный вид токена")
+    out = [f"Токен: {kind}", f"Адрес API: {FB.split('//')[1].split('/')[0]}", f"ID аккаунта: {IG_USER}"]
+
+    def check(title, path, fields=None):
+        params = {"access_token": IG_TOKEN}
+        if fields:
+            params["fields"] = fields
+        try:
+            r = requests.get(f"{FB}/{path}", params=params, timeout=60)
+            j = r.json()
+        except Exception as e:  # noqa
+            out.append(f"❌ {title}: {str(e)[:120]}")
+            return None
+        if r.ok and "error" not in j:
+            out.append(f"✅ {title}: {json.dumps(j, ensure_ascii=False)[:160]}")
+            return j
+        err = j.get("error", {})
+        out.append(f"❌ {title}: {err.get('message', r.text[:120])} (код {err.get('code')}/{err.get('error_subcode')})")
+        return None
+
+    check("токен читает профиль", "me", "id,username" if IG_TOKEN.startswith("IG") else "id,name")
+    check("аккаунт по IG_USER_ID", IG_USER, "username")
+    check("доступ к API публикации", f"{IG_USER}/content_publishing_limit", "quota_usage,config")
+    if not IG_TOKEN.startswith("IG"):
+        check("выданные права", "me/permissions")
+    return "\n".join(out)
 
 
 def ig_stats(media_id):
@@ -1620,7 +1672,7 @@ def cmd_create():
                 except Exception as e:  # noqa
                     notify(f"ℹ️ Claude недоступен ({str(e)[:200]}). Сценарий пишет Gemini.")
             if story is None:
-                story = gemini(build_script_prompt(facts, cast))
+                story = gemini(build_script_prompt(facts, cast), models=GEMINI_SCRIPT_MODELS)
         else:
             story = gemini((story_prompt_photo if photo else story_prompt)(videos, cast))
         story = (validate_story_script(story) if story_mode else
@@ -1635,6 +1687,7 @@ def cmd_create():
 
         parts, clips, audios, durs = [], [], [], []
         voices = make_all_voices(story["scenes"]) if story_mode else None
+        last_img, img_fail = None, 0
         for i, sc in enumerate(story["scenes"]):
             tag = f"s{i:02d}"
             log(f"сцена {i + 1}/{len(story['scenes'])}: {sc['narration']}")
@@ -1650,8 +1703,16 @@ def cmd_create():
                         if c0 and (c0["dir"] / "face.png").exists():
                             face = c0["dir"] / "face.png"
                             break
-                gen_image("vscene", expand_prompt(sc["image_prompt"], cast) + extra +
-                          ", no text, no letters, no watermark", img, seed, refs or None, face=face)
+                try:
+                    gen_image("vscene", expand_prompt(sc["image_prompt"], cast) + extra +
+                              ", no text, no letters, no watermark", img, seed, refs or None, face=face)
+                except RuntimeError as e:
+                    if last_img is None or img_fail >= 4:
+                        raise
+                    img_fail += 1
+                    log(f"картинка сцены {i + 1} не получилась, беру предыдущую: {str(e)[:120]}")
+                    shutil.copy(last_img, img)
+                last_img = img
                 if voices:
                     voice = voices[i]
                 else:
@@ -1690,6 +1751,8 @@ def cmd_create():
             parts.append(render_scene(tag, sc, bg, layers, prop, voice))
 
         final = WORK / "final.mp4"
+        if story_mode and img_fail:
+            notify(f"⚠️ Не удалось нарисовать картинок: {img_fail}. Вместо них использованы соседние кадры.")
         if story_mode:
             assemble(clips, audios, durs, final)
         else:
@@ -1738,7 +1801,8 @@ def cmd_create():
 HELP = ("Я делаю ролики про Free Fire сам по расписанию.\n"
         "/make - сделать ролик прямо сейчас\n"
         "/stats - статистика и вывод\n"
-        "/status - сколько роликов ждёт решения")
+        "/status - сколько роликов ждёт решения\n"
+        "/igtest - проверить подключение Instagram")
 
 
 def dispatch_create():
@@ -1767,6 +1831,9 @@ def handle_message(m):
     elif cmd == "/stats":
         tg("sendMessage", chat_id=chat, text="Собираю статистику...")
         tg("sendMessage", chat_id=chat, text=stats_report()[:4000])
+    elif cmd == "/igtest":
+        tg("sendMessage", chat_id=chat, text="Проверяю Instagram...")
+        tg("sendMessage", chat_id=chat, text=ig_diagnose()[:4000])
     elif cmd == "/status":
         vs = load_videos()
         pend = sum(1 for v in vs if v["status"] == "pending")
@@ -1853,5 +1920,6 @@ def cmd_stats():
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    {"create": cmd_create, "poll": cmd_poll, "stats": cmd_stats}.get(
+    {"create": cmd_create, "poll": cmd_poll, "stats": cmd_stats,
+     "igtest": lambda: print(ig_diagnose())}.get(
         mode, lambda: sys.exit(__doc__))()
