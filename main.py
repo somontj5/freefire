@@ -42,6 +42,9 @@ IG_TOKEN = ENV("IG_ACCESS_TOKEN", "")
 POLL_KEY = ENV("POLLINATIONS_KEY", "")
 # Генерация картинок: hf - Hugging Face Space (FLUX), pollinations, auto - сначала HF, при сбое Pollinations
 HF_TOKEN = ENV("HF_TOKEN", "")
+# Запасные токены HF_TOKEN1..HF_TOKEN6: когда у одного аккаунта кончается GPU-квота, берётся следующий
+HF_TOKENS = list(dict.fromkeys(t.strip() for t in
+                               [HF_TOKEN] + [ENV(f"HF_TOKEN{i}", "") for i in range(1, 7)] if t and t.strip()))
 # Бесплатные Spaces Hugging Face по очереди: сначала качественный dev, при исчерпании GPU-лимита schnell
 HF_SPACES = list(dict.fromkeys(x for x in [ENV("HF_SPACE"), "black-forest-labs/FLUX.2-klein-9B",
                                            "Tongyi-MAI/Z-Image-Turbo", "black-forest-labs/FLUX.1-schnell",
@@ -368,7 +371,7 @@ class PollDead(RuntimeError):
     pass
 
 
-_hf = {"clients": {}, "dead": set(), "poll_dead": False, "horde_dead": False, "horde_spent": 0.0, "fails": {}}
+_hf = {"clients": {}, "dead": set(), "poll_dead": False, "horde_dead": False, "horde_spent": 0.0, "fails": {}, "tok_dead": set()}
 
 
 def _walk_paths(obj):
@@ -494,15 +497,35 @@ def ensure_gradio():
 
 
 def hf_generate(prompt, path, seed, size, space, face=None):
+    """Пробует токены по очереди: если у одного кончилась квота GPU - берёт следующий.
+    HFQuota наружу летит только когда исчерпаны ВСЕ токены для этого Space."""
+    tokens = HF_TOKENS or [""]            # без токенов - анонимный доступ, как раньше
+    alive = [i for i in range(len(tokens)) if (space, i) not in _hf["tok_dead"]]
+    if not alive:
+        raise HFQuota(f"квота исчерпана на всех токенах ({len(tokens)})")
+    for n, i in enumerate(alive):
+        try:
+            _hf_generate_one(prompt, path, seed, size, space, tokens[i], face)
+            return
+        except HFQuota as e:
+            _hf["tok_dead"].add((space, i))
+            left = len(alive) - n - 1
+            log(f"{space.split('/')[-1]}: токен #{i + 1} без квоты, осталось токенов: {left}")
+            if left == 0:
+                raise HFQuota(f"квота исчерпана на всех токенах ({len(tokens)}): {str(e)[:200]}")
+
+
+def _hf_generate_one(prompt, path, seed, size, space, token, face=None):
     """Картинка из бесплатного Hugging Face Space через gradio_client (FLUX, Z-Image-Turbo, InstantID)."""
     ensure_gradio()
     from gradio_client import Client
-    if space not in _hf["clients"]:
+    ck = (space, token)
+    if ck not in _hf["clients"]:
         try:
-            _hf["clients"][space] = Client(space, hf_token=HF_TOKEN or None)
+            _hf["clients"][ck] = Client(space, hf_token=token or None)
         except TypeError:
-            _hf["clients"][space] = Client(space, token=HF_TOKEN or None)
-    c = _hf["clients"][space]
+            _hf["clients"][ck] = Client(space, token=token or None)
+    c = _hf["clients"][ck]
     api = c.view_api(return_format="dict")["named_endpoints"]
     ep = next((e for e in ("/infer", "/generate", "/generate_image", "/predict") if e in api), None)
     if ep is None:
@@ -525,7 +548,8 @@ def hf_generate(prompt, path, seed, size, space, face=None):
             return
         except Exception as e:  # noqa
             last = e
-            if "quota" in str(e).lower():
+            low = str(e).lower()
+            if "quota" in low or "unauthorized" in low or "invalid token" in low or "401" in low:
                 raise HFQuota(str(e)[:300])
             time.sleep(5 * (attempt + 1))
     _hf["fails"][space] = _hf["fails"].get(space, 0) + 1
