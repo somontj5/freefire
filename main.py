@@ -55,6 +55,20 @@ AUTO_PUBLISH = (ENV("AUTO_PUBLISH") or "").lower() in ("1", "true", "yes")
 MODE = (ENV("VIDEO_MODE") or "story").lower()   # story - как в примерах (по умолчанию)
 PHOTO_ZOOM = (ENV("PHOTO_ZOOM") or "").lower() in ("1", "true", "yes")  # лёгкий наезд на фото
 VOICE = ENV("TTS_VOICE") or "ru-RU-DmitryNeural"
+# Озвучка: gemini - Gemini TTS (одним запросом на весь ролик), edge - голос Microsoft по фразам, auto - Gemini, потом Edge.
+# Лимит бесплатного Gemini TTS: 10 запросов в сутки на модель, поэтому на ролик уходит 1 запрос.
+TTS_PROVIDER = (ENV("TTS_PROVIDER") or "auto").lower()
+# Сценарист: Claude через Puter (по токену аккаунта puter.com) или Gemini. auto - Claude, если есть токен, иначе Gemini.
+PUTER_TOKEN = ENV("PUTER_AUTH_TOKEN", "")
+CLAUDE_MODEL = ENV("CLAUDE_MODEL") or "claude-sonnet-4-6"
+SCRIPT_WRITER = (ENV("SCRIPT_WRITER") or "auto").lower()
+GEMINI_VOICE = ENV("GEMINI_VOICE") or "Charon"
+GEMINI_TTS_MODELS = list(dict.fromkeys(m for m in [ENV("GEMINI_TTS_MODEL"), "gemini-3.8-flash-lite-tts",
+                                                   "gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview",
+                                                   "gemini-2.5-flash-preview-tts"] if m))
+TTS_STYLE = ("Calm, even, unhurried conversational delivery, like a friend telling a story. No dramatic emotion, "
+             "no exclamations. Steady brisk pace with very short pauses between sentences.")
+TTS_PREFIX = "Say in Russian, calmly and evenly, like a friend telling a story, at a steady brisk pace"
 # real    - реальные истории про Free Fire (поиск Gemini + проверка фактов), по умолчанию
 # fiction - выдуманные истории
 STORY_TYPE = (ENV("STORY_TYPE") or "real").lower()
@@ -217,6 +231,35 @@ def gemini(prompt, as_json=True):
         return text
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
     return json.loads(text)
+
+
+def parse_json_loose(text):
+    text = re.sub(r"^```(?:json)?|```$", "", str(text).strip(), flags=re.M).strip()
+    a, b = text.find("{"), text.rfind("}")
+    if a < 0 or b <= a:
+        raise ValueError("в ответе нет JSON")
+    return json.loads(text[a:b + 1])
+
+
+def claude_json(prompt):
+    """Сценарий от Claude. Puter даёт OpenAI-совместимый адрес, токен берётся на puter.com/dashboard."""
+    last = None
+    for attempt in range(2):
+        r = requests.post("https://api.puter.com/puterai/openai/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {PUTER_TOKEN}", "Content-Type": "application/json"},
+                          json={"model": CLAUDE_MODEL, "max_tokens": 8000,
+                                "messages": [{"role": "user", "content": prompt}]}, timeout=600)
+        if not r.ok:
+            raise RuntimeError(f"Claude/Puter {r.status_code}: {r.text[:220]}")
+        content = r.json()["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(x.get("text", "") for x in content if isinstance(x, dict))
+        try:
+            return parse_json_loose(content)
+        except Exception as e:  # noqa
+            last = e
+            prompt += "\n\nВерни ТОЛЬКО валидный JSON без пояснений."
+    raise RuntimeError(f"Claude вернул не JSON: {last}")
 
 
 def gemini_search(prompt):
@@ -775,6 +818,150 @@ async def _tts(text, path, voice, rate):
     await edge_tts.Communicate(text, voice, rate=rate).save(str(path))
 
 
+class TTSQuota(RuntimeError):
+    pass
+
+
+_tts_dead = set()
+
+
+def gemini_tts_once(model, text, out_wav):
+    """Один запрос Gemini TTS -> wav. Модели 3.8 принимают стиль отдельным полем, старые - фразой перед текстом."""
+    import base64
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    cfg = {"responseModalities": ["AUDIO"],
+           "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_VOICE}}}}
+    v38 = "3.8" in model
+    parts = [{"text": text, "speech_metadata": {"style": TTS_STYLE}}] if v38 else [{"text": f"{TTS_PREFIX}: {text}"}]
+    r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY},
+                      json={"contents": [{"parts": parts}], "generationConfig": cfg}, timeout=300)
+    if r.status_code == 400 and v38:        # поле стиля не принято - читаем без стиля, но дословно
+        r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY},
+                          json={"contents": [{"parts": [{"text": text}]}], "generationConfig": cfg}, timeout=300)
+    if r.status_code == 429:
+        raise TTSQuota(_err_text(r))
+    if not r.ok:
+        raise RuntimeError(f"{model} {r.status_code}: {_err_text(r)}")
+    inline = None
+    for p in r.json()["candidates"][0]["content"]["parts"]:
+        inline = p.get("inlineData") or p.get("inline_data") or inline
+    if not inline:
+        raise RuntimeError(f"{model}: ответ без аудио")
+    raw = base64.b64decode(inline["data"])
+    mime = inline.get("mimeType") or inline.get("mime_type") or ""
+    if "wav" in mime or "mpeg" in mime or "mp3" in mime:
+        tmp = WORK / "tts_raw.bin"
+        tmp.write_bytes(raw)
+        run(["ffmpeg", "-y", "-i", str(tmp), "-ac", "1", "-ar", "24000", str(out_wav)])
+    else:                                    # PCM 16 бит, обычно 24 кГц
+        rate = (re.search(r"rate=(\d+)", mime) or [None, "24000"])[1]
+        tmp = WORK / "tts_raw.pcm"
+        tmp.write_bytes(raw)
+        run(["ffmpeg", "-y", "-f", "s16le", "-ar", rate, "-ac", "1", "-i", str(tmp), str(out_wav)])
+    if not out_wav.exists() or duration(out_wav) < 0.5:
+        raise RuntimeError(f"{model}: пустое аудио")
+
+
+def find_silences(wav):
+    r = subprocess.run(["ffmpeg", "-i", str(wav), "-af", "silencedetect=noise=-38dB:d=0.10", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    out = []
+    for e, dur in re.findall(r"silence_end: ([\d.]+) \| silence_duration: ([\d.]+)", r.stderr):
+        e, dur = float(e), float(dur)
+        out.append((e - dur / 2, dur))
+    return out
+
+
+def plan_cuts(total, weights, cands):
+    """Где резать общую озвучку на фразы-сцены: ближайшие к ожидаемым местам паузы (динамическое программирование)."""
+    n = len(weights)
+    if n <= 1:
+        return []
+    tot, cum, exp = sum(weights), 0, []
+    for w in weights[:-1]:
+        cum += w
+        exp.append(total * cum / tot)
+    pts = [(c, -min(d, 0.6)) for c, d in cands if 0.3 < c < total - 0.3] + [(e, 0.8) for e in exp]
+    pts.sort()
+    m, INF = len(pts), 1e18
+    dp = [[INF] * m for _ in range(n - 1)]
+    back = [[-1] * m for _ in range(n - 1)]
+    for j in range(m):
+        dp[0][j] = (pts[j][0] - exp[0]) ** 2 + pts[j][1]
+    for k in range(1, n - 1):
+        best, bi, p = INF, -1, 0
+        for j in range(m):
+            while p < j and pts[p][0] <= pts[j][0] - 0.3:
+                if dp[k - 1][p] < best:
+                    best, bi = dp[k - 1][p], p
+                p += 1
+            if bi >= 0:
+                dp[k][j] = best + (pts[j][0] - exp[k]) ** 2 + pts[j][1]
+                back[k][j] = bi
+    j = min(range(m), key=lambda x: dp[n - 2][x])
+    cuts = [pts[j][0]]
+    for k in range(n - 2, 0, -1):
+        j = back[k][j]
+        cuts.append(pts[j][0])
+    return sorted(cuts)
+
+
+def split_voice(wav, phrases, tag):
+    total = duration(wav)
+    cuts = [0.0] + plan_cuts(total, [len(p) + 3 for p in phrases], find_silences(wav)) + [total]
+    files = []
+    for i in range(len(phrases)):
+        out = WORK / f"{tag}_{i:02d}.wav"
+        run(["ffmpeg", "-y", "-i", str(wav), "-ss", f"{cuts[i]:.3f}", "-to", f"{cuts[i + 1]:.3f}",
+             "-ac", "1", str(out)])
+        trim_silence(out)
+        files.append(out)
+    return files
+
+
+def make_all_voices(scenes):
+    """Озвучка всего ролика одним запросом (частями, если текст длиннее лимита поля). None - если не вышло."""
+    if OFFLINE or TTS_PROVIDER == "edge" or not GEMINI_KEY:
+        return None
+    phrases = [(sc["narration"].rstrip() if sc["narration"].rstrip()[-1:] in ".?" else sc["narration"].rstrip() + ".")
+               for sc in scenes]
+    chunks, cur, size = [], [], 0
+    for i, ph in enumerate(phrases):
+        b = len(ph.encode("utf-8")) + 1
+        if cur and size + b > 3400:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append(i)
+        size += b
+    chunks.append(cur)
+    files = [None] * len(phrases)
+    try:
+        for ci, idxs in enumerate(chunks):
+            wav = WORK / f"tts_chunk{ci}.wav"
+            text = " ".join(phrases[i] for i in idxs)
+            last = None
+            for model in GEMINI_TTS_MODELS:
+                if model in _tts_dead:
+                    continue
+                try:
+                    gemini_tts_once(model, text, wav)
+                    log(f"озвучка: {model}, часть {ci + 1}/{len(chunks)}")
+                    break
+                except TTSQuota as e:
+                    _tts_dead.add(model)
+                    last = f"{model}: лимит ({str(e)[:100]})"
+                except Exception as e:  # noqa
+                    last = f"{model}: {str(e)[:140]}"
+            else:
+                raise RuntimeError(last or "нет доступных моделей")
+            for i, f in zip(idxs, split_voice(wav, [phrases[i] for i in idxs], f"tts{ci}")):
+                files[i] = f
+        return files
+    except Exception as e:  # noqa
+        notify(f"ℹ️ Gemini TTS недоступен ({str(e)[:200]}). Озвучиваю голосом Microsoft.")
+        return None
+
+
 def trim_silence(path):
     """Срезает тишину в начале и конце фразы, чтобы между предложениями не было длинных пауз."""
     tmp = pathlib.Path(str(path) + ".trim.wav")
@@ -976,6 +1163,9 @@ def validate_story_script(s):
             sc["card"] = {"lines": lines, "red": red if isinstance(red, int) and 0 <= red < len(lines) else None}
         else:
             sc["card"] = None
+    # с первой секунды видно, про что ролик
+    if s["scenes"] and not s["scenes"][0].get("card"):
+        s["scenes"][0]["card"] = {"lines": ["FREE FIRE"], "red": 0}
     # карточка рубрики после хука: ИМЯ / ИСТОРИЯ / ЗА ОДНУ МИНУТУ (последняя строка красная)
     idx = min(3, len(s["scenes"]) - 1)
     if s["title_line"] and not s["scenes"][idx].get("card"):
@@ -1399,10 +1589,12 @@ def research(videos):
     raise RuntimeError(f"Не нашёл надёжную историю за 3 попытки: {last}")
 
 
-def build_script_prompt(facts, cast):
+def build_script_prompt(facts, cast, writer="gemini"):
     import prompts
     heroes = "\n".join(f"- {c['name']}: {c['description']}" for c in cast.values()) or "- пока нет"
     tpl = prompts.SCRIPT_PROMPT_STORY if MODE == "story" else prompts.SCRIPT_PROMPT
+    if writer == "claude" and MODE == "story":
+        tpl = prompts.SCRIPT_PROMPT_CLAUDE
     return tpl.replace("<<FACTS>>", facts).replace("<<HEROES>>", heroes)
 
 
@@ -1420,7 +1612,15 @@ def cmd_create():
             story = SAMPLE_STORY_SHORTS if story_mode else (SAMPLE_STORY_PHOTO if photo else SAMPLE_STORY)
         elif photo and STORY_TYPE == "real":
             facts, sources = research(videos)
-            story = gemini(build_script_prompt(facts, cast))
+            story = None
+            if PUTER_TOKEN and SCRIPT_WRITER in ("auto", "claude") and story_mode:
+                try:
+                    story = claude_json(build_script_prompt(facts, cast, "claude"))
+                    log(f"сценарий написал Claude ({CLAUDE_MODEL})")
+                except Exception as e:  # noqa
+                    notify(f"ℹ️ Claude недоступен ({str(e)[:200]}). Сценарий пишет Gemini.")
+            if story is None:
+                story = gemini(build_script_prompt(facts, cast))
         else:
             story = gemini((story_prompt_photo if photo else story_prompt)(videos, cast))
         story = (validate_story_script(story) if story_mode else
@@ -1434,6 +1634,7 @@ def cmd_create():
                 ensure_character(c["name"], c["description"], cast, portrait=True)
 
         parts, clips, audios, durs = [], [], [], []
+        voices = make_all_voices(story["scenes"]) if story_mode else None
         for i, sc in enumerate(story["scenes"]):
             tag = f"s{i:02d}"
             log(f"сцена {i + 1}/{len(story['scenes'])}: {sc['narration']}")
@@ -1451,8 +1652,11 @@ def cmd_create():
                             break
                 gen_image("vscene", expand_prompt(sc["image_prompt"], cast) + extra +
                           ", no text, no letters, no watermark", img, seed, refs or None, face=face)
-                voice = WORK / f"{tag}.mp3"
-                make_voice(sc["narration"], voice)
+                if voices:
+                    voice = voices[i]
+                else:
+                    voice = WORK / f"{tag}.mp3"
+                    make_voice(sc["narration"], voice)
                 d = round(max(1.4, duration(voice) + 0.06), 2)
                 clips.append(render_clip(tag, sc, img, d))
                 audios.append(scene_audio(tag, sc, voice, d))
