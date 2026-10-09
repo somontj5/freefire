@@ -1,6 +1,15 @@
 name: create
 on:
   workflow_dispatch:
+    inputs:
+      topic:
+        description: "Тема ролика (пусто = случайная)"
+        required: false
+        default: ""
+      script:
+        description: "Готовый сценарий (пусто = бот пишет сам)"
+        required: false
+        default: ""
 
 concurrency:
   group: create
@@ -45,6 +54,8 @@ jobs:
           HF_TOKEN4: ${{ secrets.HF_TOKEN4 }}
           HF_TOKEN5: ${{ secrets.HF_TOKEN5 }}
           HF_TOKEN6: ${{ secrets.HF_TOKEN6 }}
+          TOPIC: ${{ inputs.topic }}
+          SCRIPT_TEXT: ${{ inputs.script }}
           AUTO_PUBLISH: ${{ vars.AUTO_PUBLISH }}
           VIDEO_MODE: ${{ vars.VIDEO_MODE }}
           PHOTO_ZOOM: ${{ vars.PHOTO_ZOOM }}
