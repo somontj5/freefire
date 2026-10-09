@@ -51,7 +51,8 @@ HF_SPACES = list(dict.fromkeys(x for x in [ENV("HF_SPACE"), "black-forest-labs/F
                                            "black-forest-labs/FLUX.1-dev"] if x))
 # Картинка из картинки (герой по образцу): Space на FLUX.1-schnell
 IMG2IMG_SPACE = ENV("IMG2IMG_SPACE") or "Akjava/flux1-schnell-img2img"
-IMG2IMG_STRENGTH = float(ENV("IMG2IMG_STRENGTH") or 0.7)
+# чем выше, тем сильнее кадр отличается от образца героя (0.7 давало одинаковые стоячие позы)
+IMG2IMG_STRENGTH = float(ENV("IMG2IMG_STRENGTH") or 0.85)
 # AI Horde - бесплатная сеть GPU без дневной квоты (медленнее, качество проще). Ключ не нужен.
 HORDE_KEY = ENV("HORDE_API_KEY") or "0000000000"
 HORDE_BUDGET = int(ENV("HORDE_BUDGET") or 1500)      # сколько секунд за запуск готовы ждать Horde
@@ -59,6 +60,10 @@ HORDE_BUDGET = int(ENV("HORDE_BUDGET") or 1500)      # сколько секун
 INSTANTID = (ENV("INSTANTID") or "").lower() in ("1", "true", "yes")
 INSTANTID_SPACE = ENV("INSTANTID_SPACE") or "InstantX/InstantID"
 HF_STEPS = ENV("HF_STEPS", "")
+# Тема ролика из команды /тема в боте (пусто = случайная из prompts.DEFAULT_TOPICS, как раньше)
+TOPIC = (ENV("TOPIC") or "").strip()
+# Готовый сценарий автора (команда /make с текстом): Gemini только режет его на сцены и рисует картинки
+SCRIPT_TEXT = (ENV("SCRIPT_TEXT") or "").strip()
 IMAGE_PROVIDER = (ENV("IMAGE_PROVIDER") or "auto").lower()
 AUTO_PUBLISH = (ENV("AUTO_PUBLISH") or "").lower() in ("1", "true", "yes")
 # photo  - каждая сцена одно готовое фото (по умолчанию)
@@ -371,7 +376,17 @@ class PollDead(RuntimeError):
     pass
 
 
-_hf = {"clients": {}, "dead": set(), "poll_dead": False, "horde_dead": False, "horde_spent": 0.0, "fails": {}, "tok_dead": set()}
+class NoStory(RuntimeError):
+    """Не нашлась надёжная история по теме: не авария, просто сообщаем в Telegram."""
+
+
+_hf = {"clients": {}, "dead": set(), "poll_dead": False, "horde_dead": False, "horde_spent": 0.0, "fails": {}, "tok_dead": set(), "api": {}, "noted": set()}
+
+
+def quota_note(key, text):
+    if key not in _hf["noted"]:
+        _hf["noted"].add(key)
+        notify(text)
 
 
 def _walk_paths(obj):
@@ -388,7 +403,7 @@ def _walk_paths(obj):
             yield from _walk_paths(x)
 
 
-def _space_kwargs(params, prompt, seed, size, face):
+def _space_kwargs(params, prompt, seed, size, face, strength=None):
     """Подбирает аргументы Space по именам его параметров: у разных Spaces они немного отличаются."""
     from gradio_client import handle_file
     kw, face_used = {}, False
@@ -417,7 +432,7 @@ def _space_kwargs(params, prompt, seed, size, face):
         elif low in ("steps", "num_inference_steps") and HF_STEPS:
             kw[name] = int(HF_STEPS)
         elif face and ("strength" in low or "denois" in low):
-            kw[name] = IMG2IMG_STRENGTH
+            kw[name] = strength if strength is not None else IMG2IMG_STRENGTH
         elif comp in ("image", "file", "gallery") or "image" in low or "file" in low:
             if face and not face_used and "pose" not in low and "mask" not in low:
                 kw[name] = handle_file(str(face))
@@ -496,43 +511,45 @@ def ensure_gradio():
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gradio_client"], check=True)
 
 
-def hf_generate(prompt, path, seed, size, space, face=None):
-    """Пробует токены по очереди: если у одного кончилась квота GPU - берёт следующий.
-    HFQuota наружу летит только когда исчерпаны ВСЕ токены для этого Space."""
+def hf_generate(prompt, path, seed, size, space, face=None, strength=None):
+    """Пробует токены по очереди. Квота ZeroGPU общая на аккаунт, поэтому токен без квоты
+    сразу считается мёртвым для ВСЕХ Spaces. HFQuota наружу летит, когда кончились все токены."""
     tokens = HF_TOKENS or [""]            # без токенов - анонимный доступ, как раньше
-    alive = [i for i in range(len(tokens)) if (space, i) not in _hf["tok_dead"]]
+    alive = [i for i in range(len(tokens)) if i not in _hf["tok_dead"]]
     if not alive:
         raise HFQuota(f"квота исчерпана на всех токенах ({len(tokens)})")
     for n, i in enumerate(alive):
         try:
-            _hf_generate_one(prompt, path, seed, size, space, tokens[i], face)
+            _hf_generate_one(prompt, path, seed, size, space, tokens[i], face, strength)
             return
         except HFQuota as e:
-            _hf["tok_dead"].add((space, i))
+            _hf["tok_dead"].add(i)
             left = len(alive) - n - 1
-            log(f"{space.split('/')[-1]}: токен #{i + 1} без квоты, осталось токенов: {left}")
+            log(f"токен #{i + 1} без квоты, осталось токенов: {left}")
             if left == 0:
                 raise HFQuota(f"квота исчерпана на всех токенах ({len(tokens)}): {str(e)[:200]}")
 
 
-def _hf_generate_one(prompt, path, seed, size, space, token, face=None):
+def _hf_generate_one(prompt, path, seed, size, space, token, face=None, strength=None):
     """Картинка из бесплатного Hugging Face Space через gradio_client (FLUX, Z-Image-Turbo, InstantID)."""
     ensure_gradio()
     from gradio_client import Client
     ck = (space, token)
     if ck not in _hf["clients"]:
         try:
-            _hf["clients"][ck] = Client(space, hf_token=token or None)
+            _hf["clients"][ck] = Client(space, hf_token=token or None, verbose=False)
         except TypeError:
-            _hf["clients"][ck] = Client(space, token=token or None)
+            _hf["clients"][ck] = Client(space, token=token or None, verbose=False)
     c = _hf["clients"][ck]
-    api = c.view_api(return_format="dict")["named_endpoints"]
+    if ck not in _hf["api"]:
+        _hf["api"][ck] = c.view_api(print_info=False, return_format="dict")["named_endpoints"]
+    api = _hf["api"][ck]
     ep = next((e for e in ("/infer", "/generate", "/generate_image", "/predict") if e in api), None)
     if ep is None:
         ep = next((e for e, v in api.items() if any("prompt" in p["parameter_name"].lower() for p in v["parameters"])), None)
     if ep is None:
         raise RuntimeError(f"в Space {space} не нашёл метод генерации")
-    kwargs = _space_kwargs(api[ep]["parameters"], prompt, seed, size, face)
+    kwargs = _space_kwargs(api[ep]["parameters"], prompt, seed, size, face, strength)
     last = None
     for attempt in range(2):
         try:
@@ -549,7 +566,7 @@ def _hf_generate_one(prompt, path, seed, size, space, token, face=None):
         except Exception as e:  # noqa
             last = e
             low = str(e).lower()
-            if "quota" in low or "unauthorized" in low or "invalid token" in low or "401" in low:
+            if "quota" in low or "unauthorized" in low or "invalid token" in low:
                 raise HFQuota(str(e)[:300])
             time.sleep(5 * (attempt + 1))
     _hf["fails"][space] = _hf["fails"].get(space, 0) + 1
@@ -558,7 +575,7 @@ def _hf_generate_one(prompt, path, seed, size, space, token, face=None):
     raise RuntimeError(f"HF {space}: {str(last)[:300]}")
 
 
-def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None):
+def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strength=None):
     if OFFLINE:
         fake_image(kind, prompt, path)
         return
@@ -570,11 +587,11 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None):
     if init and CHAR_REF and IMAGE_PROVIDER in ("hf", "auto") and IMG2IMG_SPACE not in _hf["dead"]:
         try:       # новая сцена по образцу героя: одежда и внешность сохраняются
             hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
-                        (768, 1344) if vertical else (1024, 1024), IMG2IMG_SPACE, face=init)
+                        (768, 1344) if vertical else (1024, 1024), IMG2IMG_SPACE, face=init, strength=strength)
             return
         except HFQuota as e:
             _hf["dead"].add(IMG2IMG_SPACE)
-            notify(f"ℹ️ Лимит GPU для режима «по образцу» исчерпан, рисую без образца: {str(e)[:120]}")
+            quota_note("img2img", "ℹ️ Квота GPU на всех токенах Hugging Face исчерпана, рисую без образца героя")
         except Exception as e:  # noqa
             errors.append(f"img2img: {str(e)[:140]}")
     if face and INSTANTID and IMAGE_PROVIDER in ("hf", "auto") and INSTANTID_SPACE not in _hf["dead"]:
@@ -584,7 +601,7 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None):
             return
         except HFQuota as e:
             _hf["dead"].add(INSTANTID_SPACE)
-            notify(f"ℹ️ Лимит GPU для InstantID исчерпан, рисую без привязки к лицу: {str(e)[:140]}")
+            quota_note("instantid", "ℹ️ Квота GPU на всех токенах Hugging Face исчерпана, рисую без привязки к лицу")
         except Exception as e:  # noqa
             errors.append(f"InstantID: {str(e)[:160]}")
     if use_hf:
@@ -598,7 +615,7 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None):
             except HFQuota as e:
                 _hf["dead"].add(space)
                 errors.append(f"{space}: квота")
-                notify(f"ℹ️ Лимит GPU на Hugging Face для {space.split('/')[-1]} исчерпан: {str(e)[:160]}")
+                quota_note("hf", "ℹ️ Квота GPU Hugging Face исчерпана на всех токенах. Дальше Pollinations и Horde.")
             except Exception as e:  # noqa
                 errors.append(f"{space}: {str(e)[:160]}")
     if use_poll and not _hf["poll_dead"]:
@@ -861,6 +878,38 @@ def validate_photo_story(s):
             sc["sfx"] = "none"
         sc["prop"], sc["prop_motion"], sc["prop_side"] = None, "none", "center"
     return s
+
+
+SHOTS = ["extreme close-up on the face", "wide establishing shot from high above", "low angle shot looking up",
+         "over-the-shoulder shot", "side profile medium shot", "dramatic aerial view", "close-up on hands and objects",
+         "silhouette against a bright light", "dutch angle, dynamic action pose", "far wide shot, tiny figure in a huge space"]
+
+
+def diversify_prompts(scenes):
+    """Если подряд идут почти одинаковые промпты картинок, добавляем другой ракурс."""
+    seen = []
+    for i, sc in enumerate(scenes):
+        words = set(re.findall(r"[a-z]{4,}", sc["image_prompt"].lower()))
+        if any(len(words & w) / max(1, len(words | w)) > 0.5 for w in seen[-4:]):
+            sc["image_prompt"] = sc["image_prompt"].rstrip(". ") + ", " + SHOTS[i % len(SHOTS)]
+        seen.append(words)
+
+
+def ahash(path):
+    """Мини-отпечаток картинки (256 бит): похожие кадры дают близкие числа."""
+    from PIL import Image
+    im = Image.open(path).convert("L").resize((16, 16))
+    px = list(im.getdata())
+    avg = sum(px) / len(px)
+    return sum(1 << k for k, v in enumerate(px) if v > avg)
+
+
+def is_repeat(path, recent, limit=22):
+    try:
+        h = ahash(path)
+    except Exception:  # noqa
+        return False
+    return any(bin(h ^ r).count("1") <= limit for r in recent)
 
 
 MOTIONS = ("throw_right", "throw_left", "fall", "appear", "explosion")
@@ -1297,6 +1346,7 @@ def validate_story_script(s):
     if s["title_line"] and not s["scenes"][idx].get("card"):
         lines = [s["title_line"]] + SERIES_CARD
         s["scenes"][idx]["card"] = {"lines": lines[:3], "red": len(lines[:3]) - 1}
+    diversify_prompts(s["scenes"])
     return s
 
 
@@ -1529,7 +1579,8 @@ def ig_diagnose():
             out.append(f"✅ {title}: {json.dumps(j, ensure_ascii=False)[:160]}")
             return j
         err = j.get("error", {})
-        out.append(f"❌ {title}: {err.get('message', r.text[:120])} (код {err.get('code')}/{err.get('error_subcode')})")
+        out.append(f"❌ {title}: {err.get('message', r.text[:120])} (код {err.get('code')}/{err.get('error_subcode')}"
+                   f", тип {err.get('type')}, trace {err.get('fbtrace_id')})")
         return None
 
     check("токен читает профиль", "me", "id,username" if IG_TOKEN.startswith("IG") else "id,name")
@@ -1537,6 +1588,11 @@ def ig_diagnose():
     check("доступ к API публикации", f"{IG_USER}/content_publishing_limit", "quota_usage,config")
     if not IG_TOKEN.startswith("IG"):
         check("выданные права", "me/permissions")
+    if any("blocked" in x.lower() for x in out):
+        out.append("\n💡 Эта ошибка приходит от Meta, а не от бота: не проходит даже чтение профиля, значит закрыт "
+                   "доступ у приложения или токена целиком. Что проверить: 1) в developers.facebook.com в твоём приложении "
+                   "нет ли уведомления об ограничении; 2) аккаунт Business или Creator, добавлен тестером в роли приложения, "
+                   "и приглашение принято в Instagram (настройки, приложения и сайты); 3) выпусти новый токен и обнови IG_ACCESS_TOKEN.")
     return "\n".join(out)
 
 
@@ -1647,11 +1703,11 @@ WIKI_QUERIES = ["Free Fire professional player", "Free Fire YouTuber", "Free Fir
                 "Garena founder", "Free Fire esports player", "Free Fire team captain"]
 
 
-def wiki_sources():
+def wiki_sources(extra=None):
     """Запасной источник фактов: статьи Википедии (без поиска Google)."""
     from urllib.parse import quote
     pages, seen = [], set()
-    for q in random.sample(WIKI_QUERIES, 3):
+    for q in ([extra] if extra else []) + random.sample(WIKI_QUERIES, 3):
         for lang in ("ru", "en"):
             try:
                 api = f"https://{lang}.wikipedia.org/w/api.php"
@@ -1699,18 +1755,53 @@ def tavily_sources(focus):
     return pages[:10]
 
 
+_TR = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+               ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s", "t",
+                "u", "f", "h", "ts", "ch", "sh", "sch", "", "y", "", "e", "yu", "ya"]))
+
+
+def _name_tokens(text):
+    out = set()
+    for w in re.findall(r"\w+", str(text).lower()):
+        w = "".join(_TR.get(ch, ch) for ch in w)
+        if len(w) >= 4:
+            out.add(w)
+    return out
+
+
+def hero_seen(hero_line, people):
+    """Этот герой уже был? Сравниваем только имя (до запятой, без страны) и требуем совпадения
+    всех слов более короткого имени: Bruno Bittencourt и Bruno Nobru - разные люди."""
+    mine = _name_tokens(str(hero_line).split(",")[0])
+    if not mine:
+        return False
+    for p in people:
+        theirs = _name_tokens(p)
+        common = len(mine & theirs)
+        if common and common >= min(len(mine), len(theirs)):
+            return True
+    return False
+
+
 def research(videos):
     """Шаг 1: находим реальную историю и проверенные факты.
-    Источники по очереди: Tavily -> поиск Google в Gemini -> статьи Википедии."""
+    Источники по очереди: Tavily -> поиск Google в Gemini -> статьи Википедии.
+    Если тема задана вручную, держимся её; иначе берём случайные из prompts.DEFAULT_TOPICS."""
     import prompts
     hist = "\n".join(f"- {v['title']}: {v.get('summary', '')}" for v in videos[-30:]) or "- пока нет"
     people = [str(v.get("person") or "").strip() for v in videos if v.get("person")]
     people_txt = "\n".join(f"- {x}" for x in people) or "- пока нет"
     use_tavily = bool(TAVILY_KEY)
     use_search = (ENV("NO_SEARCH") or "").lower() not in ("1", "true", "yes")
+    custom = bool(TOPIC)
+    attempts = 3 if custom else 6
+    topics = prompts.DEFAULT_TOPICS
+    pool = random.sample(topics, min(len(topics), attempts))
     last = ""
-    for attempt in range(3):
-        focus = random.choice(prompts.FOCUS)
+    for attempt in range(attempts):
+        focus = TOPIC if custom else pool[attempt % len(pool)]
+        label = (f"ТЕМА ЗАДАНА ВРУЧНУЮ, держись строго её: {focus}. Если это имя или ник человека, героем должен быть именно он."
+                 if custom else focus)
         log(f"поиск истории: {focus}")
         pages, text, srcs = [], None, None
         if use_tavily:
@@ -1722,7 +1813,7 @@ def research(videos):
                 notify(f"ℹ️ Tavily недоступен ({str(e)[:200]}). Пробую другой поиск.")
         if not pages and use_search:
             try:
-                text, srcs = gemini_search(prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", focus)
+                text, srcs = gemini_search(prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", label)
                                            .replace("<<HISTORY>>", hist).replace("<<PEOPLE>>", people_txt))
             except RuntimeError as e:
                 use_search = False
@@ -1730,22 +1821,27 @@ def research(videos):
                 notify(f"ℹ️ Поиск Google в Gemini недоступен ({str(e)[:200]}). Беру факты из Википедии.")
         if text is None:
             if not pages:
-                pages = wiki_sources()
+                pages = wiki_sources(focus if custom else None)
             if not pages:
-                raise RuntimeError("Не удалось получить источники для проверки фактов")
+                last = "источники не нашлись"
+                continue
             blob = "\n\n".join(f"### {p['title']} ({p['url']})\n{p['text']}" for p in pages)
-            text = gemini(prompts.RESEARCH_FROM_TEXT_PROMPT.replace("<<FOCUS>>", focus)
+            text = gemini(prompts.RESEARCH_FROM_TEXT_PROMPT.replace("<<FOCUS>>", label)
                           .replace("<<HISTORY>>", hist).replace("<<PEOPLE>>", people_txt)
                           .replace("<<SOURCES>>", blob), as_json=False)
             srcs = [{"title": p["title"], "url": p["url"]} for p in pages]
         last = text[:200]
-        hero = (re.search(r"ГЕРОЙ:\s*(.+)", text) or [None, ""])[1].lower()
-        if hero and any(norm_word(x)[:6] and norm_word(x)[:6] in norm_word(hero) for x in people):
+        hero = (re.search(r"ГЕРОЙ:\s*(.+)", text) or [None, ""])[1]
+        if not custom and hero and hero_seen(hero, people):
             log(f"герой уже был ({hero}), ищу другого")
             continue
         if "НЕТ ИСТОРИИ" not in text and "ФАКТЫ" in text and len(text) > 300:
             return text.strip(), srcs
-    raise RuntimeError(f"Не нашёл надёжную историю за 3 попытки: {last}")
+    if custom:
+        raise NoStory(f"Не нашёл надёжных источников по теме «{TOPIC[:80]}». Уточни имя или ник игрока и страну, "
+                      "например: /тема Nobru Бразилия.")
+    raise NoStory("За 6 попыток не нашлась проверяемая история. Запусти /make ещё раз "
+                  "или задай тему сам: /тема имя или ник игрока.")
 
 
 def build_script_prompt(facts, cast, writer="gemini"):
@@ -1769,10 +1865,15 @@ def cmd_create():
         facts, sources = "", []
         if OFFLINE:
             story = SAMPLE_STORY_SHORTS if story_mode else (SAMPLE_STORY_PHOTO if photo else SAMPLE_STORY)
-        elif photo and STORY_TYPE == "real":
-            facts, sources = research(videos)
+        elif photo and (STORY_TYPE == "real" or SCRIPT_TEXT):
+            if SCRIPT_TEXT:
+                facts, sources = ("ГОТОВЫЙ СЦЕНАРИЙ АВТОРА. Озвучку бери из него почти дословно, ничего не добавляй от себя "
+                                  "и не меняй факты: только разбей на короткие сцены и придумай картинки.\n\n"
+                                  + SCRIPT_TEXT[:12000]), []
+            else:
+                facts, sources = research(videos)
             story = None
-            if PUTER_TOKEN and SCRIPT_WRITER in ("auto", "claude") and story_mode:
+            if PUTER_TOKEN and SCRIPT_WRITER in ("auto", "claude") and story_mode and not SCRIPT_TEXT:
                 try:
                     story = claude_json(build_script_prompt(facts, cast, "claude"))
                     log(f"сценарий написал Claude ({CLAUDE_MODEL})")
@@ -1799,7 +1900,7 @@ def cmd_create():
 
         parts, clips, audios, durs = [], [], [], []
         voices = make_all_voices(story["scenes"]) if story_mode else None
-        last_img, img_fail = None, 0
+        last_img, img_fail, recent = None, 0, []
         for i, sc in enumerate(story["scenes"]):
             tag = f"s{i:02d}"
             log(f"сцена {i + 1}/{len(story['scenes'])}: {sc['narration']}")
@@ -1822,9 +1923,17 @@ def cmd_create():
                         if c0 and (c0["dir"] / "face.png").exists():
                             face = c0["dir"] / "face.png"
                             break
+                base_prompt = expand_prompt(sc["image_prompt"], cast) + extra + ", no text, no letters, no watermark"
                 try:
-                    gen_image("vscene", expand_prompt(sc["image_prompt"], cast) + extra +
-                              ", no text, no letters, no watermark", img, seed, refs or None, face=face, init=init_ref)
+                    gen_image("vscene", base_prompt, img, seed, refs or None, face=face, init=init_ref,
+                              strength=min(0.95, IMG2IMG_STRENGTH + (-0.05, 0.0, 0.05)[i % 3]))
+                    if is_repeat(img, recent):
+                        log(f"кадр {i + 1} похож на предыдущие, рисую заново в другом ракурсе")
+                        try:
+                            gen_image("vscene", base_prompt + ", " + SHOTS[i % len(SHOTS)], img, seed + 7919, refs or None,
+                                      face=face, init=init_ref, strength=0.93)
+                        except RuntimeError:
+                            pass        # оставляем первый вариант
                 except RuntimeError as e:
                     if last_img is None or img_fail > max(4, int(len(story["scenes"]) * 0.4)):
                         raise
@@ -1832,6 +1941,10 @@ def cmd_create():
                     log(f"картинка сцены {i + 1} не получилась, беру предыдущую: {str(e)[:120]}")
                     shutil.copy(last_img, img)
                 last_img = img
+                try:
+                    recent = (recent + [ahash(img)])[-6:]
+                except Exception:  # noqa
+                    pass
                 if voices:
                     voice = voices[i]
                 else:
@@ -1876,6 +1989,9 @@ def cmd_create():
             assemble(clips, audios, durs, final)
         else:
             concat(parts, final)
+    except NoStory as e:
+        notify(f"🔎 {e}")
+        return
     except Exception as e:
         notify(f"❌ Не удалось собрать ролик: {e}")
         raise
@@ -1883,7 +1999,7 @@ def cmd_create():
     v = {"id": vid, "created": now_iso(), "title": story["title"], "person": story.get("title_line", ""), "summary": story.get("summary", ""),
          "caption": story.get("caption", story["title"]), "scenes": len(story["scenes"]),
          "script": [s["narration"] for s in story["scenes"]], "status": "pending", "mode": MODE,
-         "facts": facts[:6000], "sources": sources}
+         "facts": facts[:6000], "sources": sources, "topic": TOPIC, "own_script": bool(SCRIPT_TEXT)}
     log(f"готово: {final} ({duration(final):.0f} с)")
 
     try:
@@ -1918,17 +2034,23 @@ def cmd_create():
 # ───────────────────────── команда poll ─────────────────────────
 
 HELP = ("Я делаю ролики про Free Fire сам по расписанию.\n"
-        "/make - сделать ролик прямо сейчас\n"
+        "/make - сделать ролик сразу: бот сам ищет историю и пишет сценарий\n"
+        "/make и ниже твой готовый сценарий - ролик по твоему тексту\n"
+        "/тема имя или тема - ролик по твоей теме, например: /тема Nobru Бразилия\n"
         "/stats - статистика и вывод\n"
         "/status - сколько роликов ждёт решения\n"
         "/igtest - проверить подключение Instagram")
 
 
-def dispatch_create():
+def dispatch_create(topic=None, script=None):
     repo, tok = ENV("GITHUB_REPOSITORY"), ENV("GITHUB_TOKEN")
+    body = {"ref": ENV("GITHUB_REF_NAME") or "main"}
+    inputs = {k: v for k, v in (("topic", topic), ("script", script)) if v}
+    if inputs:
+        body["inputs"] = inputs
     r = requests.post(f"https://api.github.com/repos/{repo}/actions/workflows/create.yml/dispatches",
                       headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"},
-                      json={"ref": ENV("GITHUB_REF_NAME") or "main"}, timeout=60)
+                      json=body, timeout=60)
     if r.status_code != 204:
         raise RuntimeError(f"не смог запустить сборку: {r.status_code} {r.text[:200]}")
 
@@ -1945,8 +2067,25 @@ def handle_message(m):
     if cmd in ("/start", "/help"):
         tg("sendMessage", chat_id=chat, text=HELP)
     elif cmd == "/make":
-        dispatch_create()
-        tg("sendMessage", chat_id=chat, text="Запустил сборку. Ролик придёт через 10-20 минут.")
+        arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip()
+        if not arg:
+            dispatch_create()
+            tg("sendMessage", chat_id=chat, text="Запустил сборку: бот сам найдёт историю. Ролик придёт через 10-20 минут.")
+        elif len(arg) < 80:
+            tg("sendMessage", chat_id=chat,
+               text="Для /make с текстом нужен готовый сценарий (хотя бы пара предложений). "
+                    "Если это тема или имя игрока, напиши так: /тема " + arg)
+        else:
+            dispatch_create(script=arg)
+            tg("sendMessage", chat_id=chat, text=f"Запустил сборку по твоему сценарию ({len(arg)} символов). "
+                                                 "Ролик придёт через 10-20 минут.")
+    elif cmd in ("/тема", "/tema", "/topic"):
+        arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip()
+        if not arg:
+            tg("sendMessage", chat_id=chat, text="Напиши тему после команды, например: /тема Nobru Бразилия")
+        else:
+            dispatch_create(topic=arg)
+            tg("sendMessage", chat_id=chat, text=f"Запустил сборку по теме: {arg[:200]}\nРолик придёт через 10-20 минут.")
     elif cmd == "/stats":
         tg("sendMessage", chat_id=chat, text="Собираю статистику...")
         tg("sendMessage", chat_id=chat, text=stats_report()[:4000])
@@ -1975,9 +2114,9 @@ def handle_callback(cq):
     if str(TG_CHAT) != chat:
         return
     action, _, vid = cq["data"].partition(":")
-    v = get_video(vid)
     qid = cq["id"]
     mid = cq["message"]["message_id"]
+    v = get_video(vid)
     buttons = {"inline_keyboard": [[{"text": "✅ Опубликовать", "callback_data": f"pub:{vid}"},
                                     {"text": "🗑 Отклонить", "callback_data": f"rej:{vid}"}]]}
     if not v or v["status"] != "pending":
