@@ -34,7 +34,16 @@ CHARS = (WORK / "chars_offline") if OFFLINE else (ROOT / "characters")
 GEMINI_KEY = ENV("GEMINI_API_KEY", "")
 GEMINI_MODELS = [m for m in [ENV("GEMINI_MODEL"), "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"] if m]
 # Для сценария можно взять модель посильнее (один запрос на ролик): например GEMINI_SCRIPT_MODEL=gemini-3.5-flash
-GEMINI_SCRIPT_MODELS = [m for m in [ENV("GEMINI_SCRIPT_MODEL")] if m]
+# Если GEMINI_SCRIPT_MODEL пустая: цепочка от самой новой Flash к старой (у каждой свой дневной лимит, 20 запросов на free tier).
+# Когда у модели кончился дневной лимит, код сразу берёт следующую, а в конце ждёт обычная lite-модель.
+DEFAULT_SCRIPT_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+GEMINI_SCRIPT_MODELS = [ENV("GEMINI_SCRIPT_MODEL")] if ENV("GEMINI_SCRIPT_MODEL") else DEFAULT_SCRIPT_MODELS
+# Проверка кадров и реальные фото
+FRAME_CHECK = (ENV("FRAME_CHECK") or "1") != "0"      # Gemini смотрит каждую картинку: нет ли экрана телефона и надписей
+PHOTOS_ON = (ENV("REAL_PHOTOS") or "1") != "0"        # реальные фото из Википедии и Commons для якорных сцен
+MAX_PHOTOS = int(ENV("MAX_REAL_PHOTOS") or 4)
+WHISPER_ON = (ENV("WHISPER") or "1") != "0"           # точные тайминги слов для субтитров
+WHISPER_MODEL = ENV("WHISPER_MODEL") or "small"
 TG_TOKEN = ENV("TG_TOKEN", "")
 TG_CHAT = ENV("TG_CHAT_ID", "")
 IG_USER = ENV("IG_USER_ID", "")
@@ -219,6 +228,8 @@ def _gemini_request(body, patient=True, models=None):
                 errors.append(f"{model}: {r.status_code} {_err_text(r)}")
                 if not patient:
                     break
+                if r.status_code == 429 and "perday" in r.text.lower():
+                    break           # дневной лимит этой модели кончился: сразу следующая, не ждём
                 wait = _retry_delay(r) or 10 * (attempt + 1)
                 if wait > 75:
                     break
@@ -1350,20 +1361,326 @@ def validate_story_script(s):
     return s
 
 
-def words_timeline(text, d, accent):
-    """Время показа каждого слова: пропорционально длине слова (озвучка не отдаёт точные метки)."""
+# ───────────────────── промпты картинок, проверка кадров, реальные фото ─────────────────────
+
+# Эти слова генератор принимает за «нарисуй скриншот игры / экран телефона», поэтому из промптов их убираем
+BANNED_IMG = ["free fire", "garena", "video game", "mobile game", "gameplay", "screenshot", "phone screen",
+              "smartphone screen", "game screen", "computer screen", "tv screen", "screens", "screen", "display",
+              "interface", "minimap", "health bar", "hud", "ui", "app", "menu", "logo", "watermark", "caption",
+              "subtitle", "text", "game"]
+DEVICES_IMG = ["smartphone", "phone", "mobile", "tablet", "laptop", "monitor", "computer", "television", "tv",
+               "console", "controller"]
+
+
+def _word_re(words):
+    return re.compile(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
+
+
+def _tidy(t):
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"(\s*,){2,}", ",", t)
+    t = re.sub(r"\s+([,.])", r"\1", t)
+    return t.strip(" ,")
+
+
+def clean_image_prompt(prompt):
+    """Последняя страховка: выкидываем целые фрагменты (между запятыми) с запрещёнными словами.
+    Телефон как предмет в руках остаётся, пропадают экран, интерфейс, название игры."""
+    prompt = re.sub(r"\b(no|without)\s+(text|letters|logos?|watermarks?|captions?)\b", "", prompt, flags=re.I)
+    bad = _word_re(BANNED_IMG)
+    clauses = [c for c in prompt.split(",") if not bad.search(re.sub(r"\[[^\]]*\]", "", c))]
+    out = _tidy(", ".join(clauses))
+    if len(out.split()) < 5:                     # почти всё выкинули: безопасная замена, герой из скобок остаётся
+        names = re.findall(r"\[[^\]]*\]", prompt)
+        out = (names[0] if names else "A young man") + " stands in a cinematic wide shot, dramatic lighting, detailed comic illustration"
+    return out
+
+
+def strip_devices(prompt):
+    """Для повторной попытки: устройства заменяем нейтральным предметом."""
+    parts = re.split(r"(\[[^\]]*\])", prompt)
+    dev = _word_re(DEVICES_IMG)
+    return _tidy("".join(dev.sub("object", t) if k % 2 == 0 else t for k, t in enumerate(parts)))
+
+
+def jpeg_small(src, maxside=768):
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(src) if isinstance(src, (bytes, bytearray)) else src).convert("RGB")
+    im.thumbnail((maxside, maxside))
+    b = io.BytesIO()
+    im.save(b, "JPEG", quality=80)
+    return b.getvalue()
+
+
+def gemini_vision_json(prompt, jpeg_bytes):
+    """Gemini смотрит на картинку и отвечает JSON. Идёт на обычные lite-модели (500 запросов в день)."""
+    import base64
+    body = {"contents": [{"parts": [{"inline_data": {"mime_type": "image/jpeg",
+                                                    "data": base64.b64encode(jpeg_bytes).decode()}},
+                                    {"text": prompt}]}],
+            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}}
+    return parse_json_loose(_text_of(_gemini_request(body, patient=False)))
+
+
+_vis = {"fails": 0}
+FRAME_Q = ("Look at this image. Reply with JSON {\"screen\": true/false, \"text\": true/false}. "
+           "screen = true if the picture is mostly or largely a smartphone, computer or TV screen, a game screenshot, "
+           "or a game interface (buttons, health bars, minimap, menus). "
+           "text = true if there is large readable text, captions, a watermark or a logo.")
+
+
+def frame_problem(path):
+    """Причина, по которой кадр надо перерисовать, или None."""
+    if not FRAME_CHECK or OFFLINE or _vis["fails"] >= 2:
+        return None
+    try:
+        out = gemini_vision_json(FRAME_Q, jpeg_small(path))
+        _vis["fails"] = 0
+    except Exception as e:  # noqa
+        _vis["fails"] += 1
+        log("проверка кадра пропущена:", str(e)[:100])
+        return None
+    if out.get("screen") is True:
+        return "экран телефона или интерфейс игры"
+    if out.get("text") is True:
+        return "надписи на кадре"
+    return None
+
+
+def rewrite_image_prompts(story, cast):
+    """Второй вызов: отдельный «арт-директор» пишет промпты картинок по готовым фразам, плюс выбирает якорные
+    сцены для реальных фото. Если не вышло, остаются промпты из сценария (после чистки запрещённых слов)."""
+    import prompts
+    scenes = story["scenes"]
+    names = "\n".join(f"- [{c['name']}]: {c['description']}" for c in cast.values()) or "- нет"
+    p = (prompts.IMAGE_PROMPTS_PROMPT
+         .replace("<<SCENES>>", "\n".join(f"{i + 1}: {sc['narration']}" for i, sc in enumerate(scenes)))
+         .replace("<<CAST>>", names).replace("<<N>>", str(len(scenes))).replace("<<MAXPHOTOS>>", str(MAX_PHOTOS)))
+    lst, photos = None, []
+    try:
+        out = gemini(p, models=GEMINI_SCRIPT_MODELS)
+        lst = out.get("prompts") if isinstance(out, dict) else out
+        if not isinstance(lst, list) or len(lst) != len(scenes) or not all(isinstance(x, str) and len(x) > 15 for x in lst):
+            raise ValueError(f"промптов {len(lst) if isinstance(lst, list) else '?'} вместо {len(scenes)}")
+        photos = out.get("photos") or [] if isinstance(out, dict) else []
+    except Exception as e:  # noqa
+        log(f"промпты картинок: второй вызов не удался ({str(e)[:140]}), беру из сценария")
+        lst = None
+    for i, sc in enumerate(scenes):
+        sc["image_prompt"] = clean_image_prompt(lst[i] if lst else sc["image_prompt"]) or sc["image_prompt"]
+    seen_scene = set()
+    for ph in photos[:MAX_PHOTOS]:        # код сам ограничивает число якорных сцен, а не Gemini
+        try:
+            k, q = int(ph["scene"]) - 1, str(ph["query"]).strip()
+        except Exception:  # noqa
+            continue
+        if 0 <= k < len(scenes) and q and k not in seen_scene:
+            scenes[k]["photo_query"] = q[:80]
+            seen_scene.add(k)
+    diversify_prompts(scenes)
+
+
+UA = {"User-Agent": "freefire-video-bot/1.0 (GitHub Actions; educational project)"}
+_used_photos = set()
+_rejected_photos = set()
+
+
+def _plain(html):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html or "")).strip()
+
+
+def photo_candidates(query):
+    """Свободные фото: главная картинка статьи в Википедии и поиск по Wikimedia Commons."""
+    from urllib.parse import quote
+    out = []
+    try:
+        r = requests.get("https://en.wikipedia.org/w/api.php", headers=UA, timeout=30, params={
+            "action": "query", "format": "json", "generator": "search", "gsrsearch": query, "gsrlimit": 4,
+            "gsrnamespace": 0, "prop": "pageimages|description", "piprop": "thumbnail", "pithumbsize": 1600,
+            "pilicense": "free"})
+        pages = sorted(((r.json().get("query") or {}).get("pages") or {}).values(), key=lambda p: p.get("index", 99))
+        for p in pages:
+            o = p.get("thumbnail") or {}
+            if o.get("source"):
+                out.append({"url": o["source"], "w": o.get("width", 0), "h": o.get("height", 0),
+                            "title": p.get("title", ""), "desc": p.get("description", ""),
+                            "artist": "Wikipedia", "license": "free license",
+                            "page": "https://en.wikipedia.org/wiki/" + quote(p.get("title", "").replace(" ", "_"))})
+    except Exception as e:  # noqa
+        log("Википедия (фото):", str(e)[:100])
+    try:
+        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=30, params={
+            "action": "query", "format": "json", "generator": "search", "gsrsearch": f"{query} filetype:bitmap",
+            "gsrnamespace": 6, "gsrlimit": 8, "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata",
+            "iiurlwidth": 1400})
+        pages = sorted(((r.json().get("query") or {}).get("pages") or {}).values(), key=lambda p: p.get("index", 99))
+        for p in pages:
+            ii = (p.get("imageinfo") or [{}])[0]
+            md = ii.get("extmetadata") or {}
+            if ii.get("mime") not in ("image/jpeg", "image/png"):
+                continue
+            out.append({"url": ii.get("thumburl") or ii.get("url"), "w": ii.get("width", 0), "h": ii.get("height", 0),
+                        "title": p.get("title", "").replace("File:", ""),
+                        "desc": _plain((md.get("ImageDescription") or {}).get("value", ""))[:300],
+                        "artist": _plain((md.get("Artist") or {}).get("value", ""))[:60] or "Wikimedia Commons",
+                        "license": (md.get("LicenseShortName") or {}).get("value", "free license"),
+                        "page": ii.get("descriptionurl", "")})
+    except Exception as e:  # noqa
+        log("Commons (фото):", str(e)[:100])
+    return [c for c in out if c["url"] and c["w"] >= 700 and c["h"] >= 500
+            and not str(c["url"]).lower().endswith((".svg", ".gif", ".tif", ".tiff"))]
+
+
+PHOTO_JUDGE = ("You check a photo for use in a video. The narrator says: «<<NARR>>». We searched for: «<<QUERY>>». "
+               "The photo caption is: «<<CAP>>». "
+               "Do NOT identify anyone by their face: rely only on the caption and on what is visible (place, setting, objects). "
+               "ok = true only if the caption and the visible content fit the narrator's phrase, the photo is sharp, has no watermark "
+               "or text overlay, is not a collage, a drawing or a screenshot of an interface, and does not show a person in a "
+               "humiliating or ambiguous situation. Reply with JSON {\"ok\": true/false, \"reason\": \"short\"}.")
+
+
+def make_vertical(data, out):
+    """Фото -> кадр 9:16. Почти вертикальное режем под кадр, горизонтальное кладём по центру на размытый фон."""
+    import io
+    from PIL import Image, ImageFilter, ImageEnhance
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    fit = min(W / im.width, H / im.height)
+    cover = max(W / im.width, H / im.height)
+    if (im.width * fit) * (im.height * fit) >= 0.75 * W * H:
+        big = im.resize((max(W, int(im.width * cover) + 1), max(H, int(im.height * cover) + 1)))
+        x, y = (big.width - W) // 2, (big.height - H) // 2
+        big.crop((x, y, x + W, y + H)).save(out)
+        return
+    bg = im.resize((max(W, int(im.width * cover) + 1), max(H, int(im.height * cover) + 1)))
+    x, y = (bg.width - W) // 2, (bg.height - H) // 2
+    bg = bg.crop((x, y, x + W, y + H)).filter(ImageFilter.GaussianBlur(28))
+    bg = ImageEnhance.Brightness(bg).enhance(0.55)
+    fg = im.resize((W, max(1, int(im.height * W / im.width)))) if im.width * H >= im.height * W \
+        else im.resize((max(1, int(im.width * H / im.height)), H))
+    bg.paste(fg, ((W - fg.width) // 2, (H - fg.height) // 2))
+    bg.save(out)
+
+
+def real_photo(sc, out):
+    """Ищет свободное фото под фразу сцены, Gemini смотрит и решает, подходит ли. Возвращает источник или None."""
+    cands = [c for c in photo_candidates(sc["photo_query"]) if c["url"] not in _used_photos and c["url"] not in _rejected_photos][:5]
+    checked = 0
+    for c in cands:
+        if checked >= 3:
+            break
+        try:
+            data = requests.get(c["url"], headers=UA, timeout=40).content
+        except Exception:  # noqa
+            continue
+        if not 20_000 < len(data) < 15_000_000:
+            continue
+        checked += 1
+        q = (PHOTO_JUDGE.replace("<<NARR>>", sc["narration"]).replace("<<QUERY>>", sc["photo_query"])
+             .replace("<<CAP>>", f"{c['title']}. {c['desc']}"[:400]))
+        try:
+            verdict = gemini_vision_json(q, jpeg_small(data))
+        except Exception as e:  # noqa
+            log("реальное фото: Gemini не смог проверить, рисую сам:", str(e)[:100])
+            return None
+        if verdict.get("ok") is True:
+            make_vertical(data, out)
+            _used_photos.add(c["url"])
+            return {"title": f"Фото: {c['title'][:70]}, {c['artist'][:40]}, {c['license']}", "url": c["page"] or c["url"]}
+        _rejected_photos.add(c["url"])
+        log(f"фото «{c['title'][:50]}» не подошло: {str(verdict.get('reason'))[:80]}")
+    return None
+
+
+# ───────────────────── точные тайминги слов (Whisper) ─────────────────────
+
+_wh = {"model": None, "dead": False}
+
+
+def whisper_words(wav):
+    """[(слово, начало, конец)] по записи диктора или None, если Whisper не заработал."""
+    if _wh["dead"] or OFFLINE or not WHISPER_ON:
+        return None
+    try:
+        if _wh["model"] is None:
+            from faster_whisper import WhisperModel
+            _wh["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        segs, _ = _wh["model"].transcribe(str(wav), language="ru", word_timestamps=True, beam_size=1,
+                                          condition_on_previous_text=False)
+        return [(w.word.strip(), float(w.start), float(w.end)) for sg in segs for w in (sg.words or []) if w.word.strip()]
+    except Exception as e:  # noqa
+        _wh["dead"] = True
+        log("Whisper недоступен, субтитры по длине слов:", str(e)[:120])
+        return None
+
+
+def align_words(script_words, rec):
+    """Привязывает слова сценария к времени из распознавания. Совпавшие слова берут время напрямую,
+    остальные (числа, имена, другое написание) делят промежуток между соседями пропорционально длине."""
+    import difflib
+    a = [norm_word(w) for w in script_words]
+    b = [norm_word(w) for w, _, _ in rec]
+    times = [None] * len(a)
+    matched = 0
+    for blk in difflib.SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks():
+        for k in range(blk.size):
+            times[blk.a + k] = (rec[blk.b + k][1], rec[blk.b + k][2])
+            matched += 1
+    if not a or matched < max(2, len(a) * 0.4):
+        return None
+    t0, t1 = rec[0][1], rec[-1][2]
+    i = 0
+    while i < len(a):
+        if times[i] is not None:
+            i += 1
+            continue
+        j = i
+        while j < len(a) and times[j] is None:
+            j += 1
+        left = times[i - 1][1] if i > 0 else t0
+        right = times[j][0] if j < len(a) else t1
+        right = max(right, left + 0.05 * (j - i))
+        wts = [len(script_words[k]) + 2 for k in range(i, j)]
+        t = left
+        for k, wt in zip(range(i, j), wts):
+            dur = (right - left) * wt / sum(wts)
+            times[k] = (t, t + dur)
+            t += dur
+        i = j
+    return times
+
+
+def words_timeline(text, d, accent, voice=None):
+    """Время показа каждого слова. С записью диктора: по распознанным меткам Whisper.
+    Без неё или если не вышло: пропорционально длине слова."""
     words = [w for w in (re.sub(r"[.,;:?!«»\"“”]", "", x) for x in text.split()) if w]
     if not words:
         return []
+
+    def is_hot(w):
+        nw = norm_word(w)
+        return any(nw == a or (len(nw) >= 5 and len(a) >= 5 and nw[:5] == a[:5]) for a in accent)
+
+    real = None
+    if voice is not None:
+        rec = whisper_words(voice)
+        real = align_words(words, rec) if rec else None
+    if real:
+        starts = [max(0.02, st - 0.04) for st, _ in real]
+        for k in range(1, len(starts)):                     # слова идут строго друг за другом
+            starts[k] = max(starts[k], starts[k - 1] + 0.05)
+        out = []
+        for k, w in enumerate(words):
+            end = starts[k + 1] if k + 1 < len(words) else d + OVERLAP + 0.5
+            out.append([w, starts[k], end, is_hot(w)])
+        return out
     weights = [len(w) + 2 for w in words]
     lead, tail = 0.05, 0.10
     span = max(d - lead - tail, 0.5)
     tot, t, out = sum(weights), lead, []
     for w, wt in zip(words, weights):
         dur = span * wt / tot
-        nw = norm_word(w)
-        hot = any(nw == a or (len(nw) >= 5 and len(a) >= 5 and nw[:5] == a[:5]) for a in accent)
-        out.append([w, t, t + dur, hot])
+        out.append([w, t, t + dur, is_hot(w)])
         t += dur
     out[-1][2] = d + OVERLAP + 0.5      # последнее слово держится до конца кадра
     return out
@@ -1425,7 +1742,7 @@ def _drawtext(txtfile, size, color, y_expr, enable, border=5, pop_at=None):
             f"x=(w-text_w)/2:y={y_expr}:enable='{enable}'")
 
 
-def render_clip(tag, sc, img, d):
+def render_clip(tag, sc, img, d, voice=None):
     """Видео-кадр: картинка на весь экран с плавным движением, слова по одному, карточка сверху."""
     total = d + OVERLAP
     frames = int(total * FPS) + 2
@@ -1445,7 +1762,7 @@ def render_clip(tag, sc, img, d):
     if sc.get("sfx") in ("hit", "boom", "shot"):   # вспышка на ударе
         vf.append("format=yuv420p,fade=t=in:st=0:d=0.10:color=white")
 
-    for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []))):
+    for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []), voice)):
         f = WORK / f"{tag}_w{i}.txt"
         f.write_text(w, encoding="utf-8")
         vf.append(_drawtext(f, fit_size(w, 66, W * 0.94 / 1.35, 34), RED if hot else "white",
@@ -1889,6 +2206,8 @@ def cmd_create():
         for c in story.get("cast") or []:
             ensure_character(c["name"], c["description"], cast, portrait=not photo,
                              ref=photo and CHAR_REF, face=story_mode and INSTANTID)
+        if story_mode and not OFFLINE:
+            rewrite_image_prompts(story, cast)
         if not photo:
             for c in list(cast.values()):
                 ensure_character(c["name"], c["description"], cast, portrait=True)
@@ -1900,7 +2219,7 @@ def cmd_create():
 
         parts, clips, audios, durs = [], [], [], []
         voices = make_all_voices(story["scenes"]) if story_mode else None
-        last_img, img_fail, recent = None, 0, []
+        last_img, img_fail, recent, photos_used = None, 0, [], 0
         for i, sc in enumerate(story["scenes"]):
             tag = f"s{i:02d}"
             log(f"сцена {i + 1}/{len(story['scenes'])}: {sc['narration']}")
@@ -1923,17 +2242,38 @@ def cmd_create():
                         if c0 and (c0["dir"] / "face.png").exists():
                             face = c0["dir"] / "face.png"
                             break
+                used_photo = False
+                if PHOTOS_ON and sc.get("photo_query") and photos_used < MAX_PHOTOS and not OFFLINE:
+                    try:
+                        credit = real_photo(sc, img)
+                    except Exception as e:  # noqa
+                        credit = None
+                        log("реальное фото не вышло:", str(e)[:120])
+                    if credit:
+                        used_photo = True
+                        photos_used += 1
+                        sources.append(credit)
+                        log(f"сцена {i + 1}: реальное фото ({sc['photo_query']})")
                 base_prompt = expand_prompt(sc["image_prompt"], cast) + extra + ", no text, no letters, no watermark"
                 try:
-                    gen_image("vscene", base_prompt, img, seed, refs or None, face=face, init=init_ref,
-                              strength=min(0.95, IMG2IMG_STRENGTH + (-0.05, 0.0, 0.05)[i % 3]))
-                    if is_repeat(img, recent):
-                        log(f"кадр {i + 1} похож на предыдущие, рисую заново в другом ракурсе")
-                        try:
-                            gen_image("vscene", base_prompt + ", " + SHOTS[i % len(SHOTS)], img, seed + 7919, refs or None,
-                                      face=face, init=init_ref, strength=0.93)
-                        except RuntimeError:
-                            pass        # оставляем первый вариант
+                    if not used_photo:
+                        gen_image("vscene", base_prompt, img, seed, refs or None, face=face, init=init_ref,
+                                  strength=min(0.95, IMG2IMG_STRENGTH + (-0.05, 0.0, 0.05)[i % 3]))
+                        if is_repeat(img, recent):
+                            log(f"кадр {i + 1} похож на предыдущие, рисую заново в другом ракурсе")
+                            try:
+                                gen_image("vscene", base_prompt + ", " + SHOTS[i % len(SHOTS)], img, seed + 7919,
+                                          refs or None, face=face, init=init_ref, strength=0.93)
+                            except RuntimeError:
+                                pass        # оставляем первый вариант
+                        prob = frame_problem(img)
+                        if prob:
+                            log(f"кадр {i + 1}: {prob}, рисую заново без устройств")
+                            try:
+                                gen_image("vscene", strip_devices(base_prompt) + ", wide cinematic shot of people and landscape",
+                                          img, seed + 4241, refs or None, face=face, init=init_ref, strength=0.9)
+                            except RuntimeError:
+                                pass
                 except RuntimeError as e:
                     if last_img is None or img_fail > max(4, int(len(story["scenes"]) * 0.4)):
                         raise
@@ -1951,7 +2291,7 @@ def cmd_create():
                     voice = WORK / f"{tag}.mp3"
                     make_voice(sc["narration"], voice)
                 d = round(max(1.4, duration(voice) + 0.06), 2)
-                clips.append(render_clip(tag, sc, img, d))
+                clips.append(render_clip(tag, sc, img, d, voice))
                 audios.append(scene_audio(tag, sc, voice, d))
                 durs.append(d)
                 continue
@@ -2017,9 +2357,14 @@ def cmd_create():
                          {"text": "✅ Опубликовать", "callback_data": f"pub:{vid}"},
                          {"text": "🗑 Отклонить", "callback_data": f"rej:{vid}"}]]})
         v["tg_file_id"] = msg["video"]["file_id"]
-        if sources:
-            lines = "\n".join(f"- {x['title'] or 'источник'}: {x['url']}" for x in sources[:6])
+        facts_src = [x for x in sources if not str(x.get("title", "")).startswith("Фото:")]
+        photo_src = [x for x in sources if str(x.get("title", "")).startswith("Фото:")]
+        if facts_src:
+            lines = "\n".join(f"- {x['title'] or 'источник'}: {x['url']}" for x in facts_src[:6])
             notify("Проверь факты перед публикацией. Источники:\n" + lines)
+        if photo_src:
+            lines = "\n".join(f"- {x['title'][6:]}: {x['url']}" for x in photo_src)
+            notify("В ролике реальные фото. При публикации укажи авторов, если лицензия этого требует (CC BY):\n" + lines)
     save_video(v)
 
     if AUTO_PUBLISH and IG_TOKEN:
