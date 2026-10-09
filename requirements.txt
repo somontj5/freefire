@@ -4,3 +4,4 @@ rembg
 onnxruntime
 pillow
 gradio_client
+faster-whisper
