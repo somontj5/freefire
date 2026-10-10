@@ -34,16 +34,7 @@ CHARS = (WORK / "chars_offline") if OFFLINE else (ROOT / "characters")
 GEMINI_KEY = ENV("GEMINI_API_KEY", "")
 GEMINI_MODELS = [m for m in [ENV("GEMINI_MODEL"), "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"] if m]
 # Для сценария можно взять модель посильнее (один запрос на ролик): например GEMINI_SCRIPT_MODEL=gemini-3.5-flash
-# Если GEMINI_SCRIPT_MODEL пустая: цепочка от самой новой Flash к старой (у каждой свой дневной лимит, 20 запросов на free tier).
-# Когда у модели кончился дневной лимит, код сразу берёт следующую, а в конце ждёт обычная lite-модель.
-DEFAULT_SCRIPT_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
-GEMINI_SCRIPT_MODELS = [ENV("GEMINI_SCRIPT_MODEL")] if ENV("GEMINI_SCRIPT_MODEL") else DEFAULT_SCRIPT_MODELS
-# Проверка кадров и реальные фото
-FRAME_CHECK = (ENV("FRAME_CHECK") or "1") != "0"      # Gemini смотрит каждую картинку: нет ли экрана телефона и надписей
-PHOTOS_ON = (ENV("REAL_PHOTOS") or "1") != "0"        # реальные фото из Википедии и Commons для якорных сцен
-MAX_PHOTOS = int(ENV("MAX_REAL_PHOTOS") or 4)
-WHISPER_ON = (ENV("WHISPER") or "1") != "0"           # точные тайминги слов для субтитров
-WHISPER_MODEL = ENV("WHISPER_MODEL") or "small"
+GEMINI_SCRIPT_MODELS = [m for m in [ENV("GEMINI_SCRIPT_MODEL")] if m]
 TG_TOKEN = ENV("TG_TOKEN", "")
 TG_CHAT = ENV("TG_CHAT_ID", "")
 IG_USER = ENV("IG_USER_ID", "")
@@ -123,6 +114,8 @@ SERIES_CARD = [x.strip() for x in (ENV("SERIES_CARD") or "ИСТОРИЯ|ЗА О
 STYLE_STORY = ("detailed digital comic illustration, semi-realistic, cinematic lighting, rich colors, "
                "vertical 9:16 composition, no text")
 OVERLAP = 0.25      # длина перехода между кадрами, сек
+MOTION = (ENV("MOTION") or "true").lower() in ("1", "true", "yes")       # моушен-графика (false = простой монтаж)
+PARALLAX = (ENV("PARALLAX") or "true").lower() in ("1", "true", "yes")   # объём: герой из готового кадра идёт чуть быстрее фона
 RED = "0xE0101A"
 STYLE = "stylized 3D cartoon game art, vibrant colors, clean shapes, battle royale setting"
 
@@ -228,8 +221,6 @@ def _gemini_request(body, patient=True, models=None):
                 errors.append(f"{model}: {r.status_code} {_err_text(r)}")
                 if not patient:
                     break
-                if r.status_code == 429 and "perday" in r.text.lower():
-                    break           # дневной лимит этой модели кончился: сразу следующая, не ждём
                 wait = _retry_delay(r) or 10 * (attempt + 1)
                 if wait > 75:
                     break
@@ -377,6 +368,11 @@ def fake_image(kind, key, path):
         d.ellipse([40, 60, 220, 240], fill=col + (255,))
         d.rectangle([110, 10, 150, 70], fill=(150, 150, 150, 255))
     im.save(path)
+
+
+def vsize(vertical):
+    """576x1024 (ровно 9:16): проходит ограничение Spaces в 1024 пикселя и экономит GPU-время."""
+    return (576, 1024) if vertical else (1024, 1024)
 
 
 class HFQuota(RuntimeError):
@@ -598,7 +594,7 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
     if init and CHAR_REF and IMAGE_PROVIDER in ("hf", "auto") and IMG2IMG_SPACE not in _hf["dead"]:
         try:       # новая сцена по образцу героя: одежда и внешность сохраняются
             hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
-                        (768, 1344) if vertical else (1024, 1024), IMG2IMG_SPACE, face=init, strength=strength)
+                        vsize(vertical), IMG2IMG_SPACE, face=init, strength=strength)
             return
         except HFQuota as e:
             _hf["dead"].add(IMG2IMG_SPACE)
@@ -608,7 +604,7 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
     if face and INSTANTID and IMAGE_PROVIDER in ("hf", "auto") and INSTANTID_SPACE not in _hf["dead"]:
         try:       # картинка по лицу героя
             hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
-                        (768, 1344) if vertical else (1024, 1024), INSTANTID_SPACE, face=face)
+                        vsize(vertical), INSTANTID_SPACE, face=face)
             return
         except HFQuota as e:
             _hf["dead"].add(INSTANTID_SPACE)
@@ -621,7 +617,7 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
                 continue
             try:
                 hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
-                            (768, 1344) if vertical else (1024, 1024), space)
+                            vsize(vertical), space)
                 return
             except HFQuota as e:
                 _hf["dead"].add(space)
@@ -629,6 +625,9 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
                 quota_note("hf", "ℹ️ Квота GPU Hugging Face исчерпана на всех токенах. Дальше Pollinations и Horde.")
             except Exception as e:  # noqa
                 errors.append(f"{space}: {str(e)[:160]}")
+                log(f"{space}: {str(e)[:200]}")
+                if space in _hf["dead"]:
+                    quota_note(("dead", space), f"ℹ️ Space {space.split('/')[-1]} исключён на этот запуск: {str(e)[:220]}")
     if use_poll and not _hf["poll_dead"]:
         try:
             if vertical:
@@ -645,7 +644,7 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
     if use_horde and not _hf["horde_dead"]:
         try:
             horde_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
-                           (768, 1344) if vertical else (1024, 1024))
+                           vsize(vertical))
             return
         except Exception as e:  # noqa
             errors.append(f"horde: {str(e)[:140]}")
@@ -1361,326 +1360,20 @@ def validate_story_script(s):
     return s
 
 
-# ───────────────────── промпты картинок, проверка кадров, реальные фото ─────────────────────
-
-# Эти слова генератор принимает за «нарисуй скриншот игры / экран телефона», поэтому из промптов их убираем
-BANNED_IMG = ["free fire", "garena", "video game", "mobile game", "gameplay", "screenshot", "phone screen",
-              "smartphone screen", "game screen", "computer screen", "tv screen", "screens", "screen", "display",
-              "interface", "minimap", "health bar", "hud", "ui", "app", "menu", "logo", "watermark", "caption",
-              "subtitle", "text", "game"]
-DEVICES_IMG = ["smartphone", "phone", "mobile", "tablet", "laptop", "monitor", "computer", "television", "tv",
-               "console", "controller"]
-
-
-def _word_re(words):
-    return re.compile(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
-
-
-def _tidy(t):
-    t = re.sub(r"\s{2,}", " ", t)
-    t = re.sub(r"(\s*,){2,}", ",", t)
-    t = re.sub(r"\s+([,.])", r"\1", t)
-    return t.strip(" ,")
-
-
-def clean_image_prompt(prompt):
-    """Последняя страховка: выкидываем целые фрагменты (между запятыми) с запрещёнными словами.
-    Телефон как предмет в руках остаётся, пропадают экран, интерфейс, название игры."""
-    prompt = re.sub(r"\b(no|without)\s+(text|letters|logos?|watermarks?|captions?)\b", "", prompt, flags=re.I)
-    bad = _word_re(BANNED_IMG)
-    clauses = [c for c in prompt.split(",") if not bad.search(re.sub(r"\[[^\]]*\]", "", c))]
-    out = _tidy(", ".join(clauses))
-    if len(out.split()) < 5:                     # почти всё выкинули: безопасная замена, герой из скобок остаётся
-        names = re.findall(r"\[[^\]]*\]", prompt)
-        out = (names[0] if names else "A young man") + " stands in a cinematic wide shot, dramatic lighting, detailed comic illustration"
-    return out
-
-
-def strip_devices(prompt):
-    """Для повторной попытки: устройства заменяем нейтральным предметом."""
-    parts = re.split(r"(\[[^\]]*\])", prompt)
-    dev = _word_re(DEVICES_IMG)
-    return _tidy("".join(dev.sub("object", t) if k % 2 == 0 else t for k, t in enumerate(parts)))
-
-
-def jpeg_small(src, maxside=768):
-    import io
-    from PIL import Image
-    im = Image.open(io.BytesIO(src) if isinstance(src, (bytes, bytearray)) else src).convert("RGB")
-    im.thumbnail((maxside, maxside))
-    b = io.BytesIO()
-    im.save(b, "JPEG", quality=80)
-    return b.getvalue()
-
-
-def gemini_vision_json(prompt, jpeg_bytes):
-    """Gemini смотрит на картинку и отвечает JSON. Идёт на обычные lite-модели (500 запросов в день)."""
-    import base64
-    body = {"contents": [{"parts": [{"inline_data": {"mime_type": "image/jpeg",
-                                                    "data": base64.b64encode(jpeg_bytes).decode()}},
-                                    {"text": prompt}]}],
-            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}}
-    return parse_json_loose(_text_of(_gemini_request(body, patient=False)))
-
-
-_vis = {"fails": 0}
-FRAME_Q = ("Look at this image. Reply with JSON {\"screen\": true/false, \"text\": true/false}. "
-           "screen = true if the picture is mostly or largely a smartphone, computer or TV screen, a game screenshot, "
-           "or a game interface (buttons, health bars, minimap, menus). "
-           "text = true if there is large readable text, captions, a watermark or a logo.")
-
-
-def frame_problem(path):
-    """Причина, по которой кадр надо перерисовать, или None."""
-    if not FRAME_CHECK or OFFLINE or _vis["fails"] >= 2:
-        return None
-    try:
-        out = gemini_vision_json(FRAME_Q, jpeg_small(path))
-        _vis["fails"] = 0
-    except Exception as e:  # noqa
-        _vis["fails"] += 1
-        log("проверка кадра пропущена:", str(e)[:100])
-        return None
-    if out.get("screen") is True:
-        return "экран телефона или интерфейс игры"
-    if out.get("text") is True:
-        return "надписи на кадре"
-    return None
-
-
-def rewrite_image_prompts(story, cast):
-    """Второй вызов: отдельный «арт-директор» пишет промпты картинок по готовым фразам, плюс выбирает якорные
-    сцены для реальных фото. Если не вышло, остаются промпты из сценария (после чистки запрещённых слов)."""
-    import prompts
-    scenes = story["scenes"]
-    names = "\n".join(f"- [{c['name']}]: {c['description']}" for c in cast.values()) or "- нет"
-    p = (prompts.IMAGE_PROMPTS_PROMPT
-         .replace("<<SCENES>>", "\n".join(f"{i + 1}: {sc['narration']}" for i, sc in enumerate(scenes)))
-         .replace("<<CAST>>", names).replace("<<N>>", str(len(scenes))).replace("<<MAXPHOTOS>>", str(MAX_PHOTOS)))
-    lst, photos = None, []
-    try:
-        out = gemini(p, models=GEMINI_SCRIPT_MODELS)
-        lst = out.get("prompts") if isinstance(out, dict) else out
-        if not isinstance(lst, list) or len(lst) != len(scenes) or not all(isinstance(x, str) and len(x) > 15 for x in lst):
-            raise ValueError(f"промптов {len(lst) if isinstance(lst, list) else '?'} вместо {len(scenes)}")
-        photos = out.get("photos") or [] if isinstance(out, dict) else []
-    except Exception as e:  # noqa
-        log(f"промпты картинок: второй вызов не удался ({str(e)[:140]}), беру из сценария")
-        lst = None
-    for i, sc in enumerate(scenes):
-        sc["image_prompt"] = clean_image_prompt(lst[i] if lst else sc["image_prompt"]) or sc["image_prompt"]
-    seen_scene = set()
-    for ph in photos[:MAX_PHOTOS]:        # код сам ограничивает число якорных сцен, а не Gemini
-        try:
-            k, q = int(ph["scene"]) - 1, str(ph["query"]).strip()
-        except Exception:  # noqa
-            continue
-        if 0 <= k < len(scenes) and q and k not in seen_scene:
-            scenes[k]["photo_query"] = q[:80]
-            seen_scene.add(k)
-    diversify_prompts(scenes)
-
-
-UA = {"User-Agent": "freefire-video-bot/1.0 (GitHub Actions; educational project)"}
-_used_photos = set()
-_rejected_photos = set()
-
-
-def _plain(html):
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html or "")).strip()
-
-
-def photo_candidates(query):
-    """Свободные фото: главная картинка статьи в Википедии и поиск по Wikimedia Commons."""
-    from urllib.parse import quote
-    out = []
-    try:
-        r = requests.get("https://en.wikipedia.org/w/api.php", headers=UA, timeout=30, params={
-            "action": "query", "format": "json", "generator": "search", "gsrsearch": query, "gsrlimit": 4,
-            "gsrnamespace": 0, "prop": "pageimages|description", "piprop": "thumbnail", "pithumbsize": 1600,
-            "pilicense": "free"})
-        pages = sorted(((r.json().get("query") or {}).get("pages") or {}).values(), key=lambda p: p.get("index", 99))
-        for p in pages:
-            o = p.get("thumbnail") or {}
-            if o.get("source"):
-                out.append({"url": o["source"], "w": o.get("width", 0), "h": o.get("height", 0),
-                            "title": p.get("title", ""), "desc": p.get("description", ""),
-                            "artist": "Wikipedia", "license": "free license",
-                            "page": "https://en.wikipedia.org/wiki/" + quote(p.get("title", "").replace(" ", "_"))})
-    except Exception as e:  # noqa
-        log("Википедия (фото):", str(e)[:100])
-    try:
-        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=30, params={
-            "action": "query", "format": "json", "generator": "search", "gsrsearch": f"{query} filetype:bitmap",
-            "gsrnamespace": 6, "gsrlimit": 8, "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata",
-            "iiurlwidth": 1400})
-        pages = sorted(((r.json().get("query") or {}).get("pages") or {}).values(), key=lambda p: p.get("index", 99))
-        for p in pages:
-            ii = (p.get("imageinfo") or [{}])[0]
-            md = ii.get("extmetadata") or {}
-            if ii.get("mime") not in ("image/jpeg", "image/png"):
-                continue
-            out.append({"url": ii.get("thumburl") or ii.get("url"), "w": ii.get("width", 0), "h": ii.get("height", 0),
-                        "title": p.get("title", "").replace("File:", ""),
-                        "desc": _plain((md.get("ImageDescription") or {}).get("value", ""))[:300],
-                        "artist": _plain((md.get("Artist") or {}).get("value", ""))[:60] or "Wikimedia Commons",
-                        "license": (md.get("LicenseShortName") or {}).get("value", "free license"),
-                        "page": ii.get("descriptionurl", "")})
-    except Exception as e:  # noqa
-        log("Commons (фото):", str(e)[:100])
-    return [c for c in out if c["url"] and c["w"] >= 700 and c["h"] >= 500
-            and not str(c["url"]).lower().endswith((".svg", ".gif", ".tif", ".tiff"))]
-
-
-PHOTO_JUDGE = ("You check a photo for use in a video. The narrator says: «<<NARR>>». We searched for: «<<QUERY>>». "
-               "The photo caption is: «<<CAP>>». "
-               "Do NOT identify anyone by their face: rely only on the caption and on what is visible (place, setting, objects). "
-               "ok = true only if the caption and the visible content fit the narrator's phrase, the photo is sharp, has no watermark "
-               "or text overlay, is not a collage, a drawing or a screenshot of an interface, and does not show a person in a "
-               "humiliating or ambiguous situation. Reply with JSON {\"ok\": true/false, \"reason\": \"short\"}.")
-
-
-def make_vertical(data, out):
-    """Фото -> кадр 9:16. Почти вертикальное режем под кадр, горизонтальное кладём по центру на размытый фон."""
-    import io
-    from PIL import Image, ImageFilter, ImageEnhance
-    im = Image.open(io.BytesIO(data)).convert("RGB")
-    fit = min(W / im.width, H / im.height)
-    cover = max(W / im.width, H / im.height)
-    if (im.width * fit) * (im.height * fit) >= 0.75 * W * H:
-        big = im.resize((max(W, int(im.width * cover) + 1), max(H, int(im.height * cover) + 1)))
-        x, y = (big.width - W) // 2, (big.height - H) // 2
-        big.crop((x, y, x + W, y + H)).save(out)
-        return
-    bg = im.resize((max(W, int(im.width * cover) + 1), max(H, int(im.height * cover) + 1)))
-    x, y = (bg.width - W) // 2, (bg.height - H) // 2
-    bg = bg.crop((x, y, x + W, y + H)).filter(ImageFilter.GaussianBlur(28))
-    bg = ImageEnhance.Brightness(bg).enhance(0.55)
-    fg = im.resize((W, max(1, int(im.height * W / im.width)))) if im.width * H >= im.height * W \
-        else im.resize((max(1, int(im.width * H / im.height)), H))
-    bg.paste(fg, ((W - fg.width) // 2, (H - fg.height) // 2))
-    bg.save(out)
-
-
-def real_photo(sc, out):
-    """Ищет свободное фото под фразу сцены, Gemini смотрит и решает, подходит ли. Возвращает источник или None."""
-    cands = [c for c in photo_candidates(sc["photo_query"]) if c["url"] not in _used_photos and c["url"] not in _rejected_photos][:5]
-    checked = 0
-    for c in cands:
-        if checked >= 3:
-            break
-        try:
-            data = requests.get(c["url"], headers=UA, timeout=40).content
-        except Exception:  # noqa
-            continue
-        if not 20_000 < len(data) < 15_000_000:
-            continue
-        checked += 1
-        q = (PHOTO_JUDGE.replace("<<NARR>>", sc["narration"]).replace("<<QUERY>>", sc["photo_query"])
-             .replace("<<CAP>>", f"{c['title']}. {c['desc']}"[:400]))
-        try:
-            verdict = gemini_vision_json(q, jpeg_small(data))
-        except Exception as e:  # noqa
-            log("реальное фото: Gemini не смог проверить, рисую сам:", str(e)[:100])
-            return None
-        if verdict.get("ok") is True:
-            make_vertical(data, out)
-            _used_photos.add(c["url"])
-            return {"title": f"Фото: {c['title'][:70]}, {c['artist'][:40]}, {c['license']}", "url": c["page"] or c["url"]}
-        _rejected_photos.add(c["url"])
-        log(f"фото «{c['title'][:50]}» не подошло: {str(verdict.get('reason'))[:80]}")
-    return None
-
-
-# ───────────────────── точные тайминги слов (Whisper) ─────────────────────
-
-_wh = {"model": None, "dead": False}
-
-
-def whisper_words(wav):
-    """[(слово, начало, конец)] по записи диктора или None, если Whisper не заработал."""
-    if _wh["dead"] or OFFLINE or not WHISPER_ON:
-        return None
-    try:
-        if _wh["model"] is None:
-            from faster_whisper import WhisperModel
-            _wh["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        segs, _ = _wh["model"].transcribe(str(wav), language="ru", word_timestamps=True, beam_size=1,
-                                          condition_on_previous_text=False)
-        return [(w.word.strip(), float(w.start), float(w.end)) for sg in segs for w in (sg.words or []) if w.word.strip()]
-    except Exception as e:  # noqa
-        _wh["dead"] = True
-        log("Whisper недоступен, субтитры по длине слов:", str(e)[:120])
-        return None
-
-
-def align_words(script_words, rec):
-    """Привязывает слова сценария к времени из распознавания. Совпавшие слова берут время напрямую,
-    остальные (числа, имена, другое написание) делят промежуток между соседями пропорционально длине."""
-    import difflib
-    a = [norm_word(w) for w in script_words]
-    b = [norm_word(w) for w, _, _ in rec]
-    times = [None] * len(a)
-    matched = 0
-    for blk in difflib.SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks():
-        for k in range(blk.size):
-            times[blk.a + k] = (rec[blk.b + k][1], rec[blk.b + k][2])
-            matched += 1
-    if not a or matched < max(2, len(a) * 0.4):
-        return None
-    t0, t1 = rec[0][1], rec[-1][2]
-    i = 0
-    while i < len(a):
-        if times[i] is not None:
-            i += 1
-            continue
-        j = i
-        while j < len(a) and times[j] is None:
-            j += 1
-        left = times[i - 1][1] if i > 0 else t0
-        right = times[j][0] if j < len(a) else t1
-        right = max(right, left + 0.05 * (j - i))
-        wts = [len(script_words[k]) + 2 for k in range(i, j)]
-        t = left
-        for k, wt in zip(range(i, j), wts):
-            dur = (right - left) * wt / sum(wts)
-            times[k] = (t, t + dur)
-            t += dur
-        i = j
-    return times
-
-
-def words_timeline(text, d, accent, voice=None):
-    """Время показа каждого слова. С записью диктора: по распознанным меткам Whisper.
-    Без неё или если не вышло: пропорционально длине слова."""
+def words_timeline(text, d, accent):
+    """Время показа каждого слова: пропорционально длине слова (озвучка не отдаёт точные метки)."""
     words = [w for w in (re.sub(r"[.,;:?!«»\"“”]", "", x) for x in text.split()) if w]
     if not words:
         return []
-
-    def is_hot(w):
-        nw = norm_word(w)
-        return any(nw == a or (len(nw) >= 5 and len(a) >= 5 and nw[:5] == a[:5]) for a in accent)
-
-    real = None
-    if voice is not None:
-        rec = whisper_words(voice)
-        real = align_words(words, rec) if rec else None
-    if real:
-        starts = [max(0.02, st - 0.04) for st, _ in real]
-        for k in range(1, len(starts)):                     # слова идут строго друг за другом
-            starts[k] = max(starts[k], starts[k - 1] + 0.05)
-        out = []
-        for k, w in enumerate(words):
-            end = starts[k + 1] if k + 1 < len(words) else d + OVERLAP + 0.5
-            out.append([w, starts[k], end, is_hot(w)])
-        return out
     weights = [len(w) + 2 for w in words]
     lead, tail = 0.05, 0.10
     span = max(d - lead - tail, 0.5)
     tot, t, out = sum(weights), lead, []
     for w, wt in zip(words, weights):
         dur = span * wt / tot
-        out.append([w, t, t + dur, is_hot(w)])
+        nw = norm_word(w)
+        hot = any(nw == a or (len(nw) >= 5 and len(a) >= 5 and nw[:5] == a[:5]) for a in accent)
+        out.append([w, t, t + dur, hot])
         t += dur
     out[-1][2] = d + OVERLAP + 0.5      # последнее слово держится до конца кадра
     return out
@@ -1735,15 +1428,15 @@ def card_layout(lines, red, size=92, max_w=None, min_size=60):
     return out
 
 
-def _drawtext(txtfile, size, color, y_expr, enable, border=5, pop_at=None):
+def _drawtext(txtfile, size, color, y_expr, enable, border=5, pop_at=None, x_expr="(w-text_w)/2"):
     fs = f"'{size}*(1+0.35*max(0,1-(t-{pop_at:.2f})/0.14))'" if pop_at is not None else size
     return (f"drawtext=fontfile={FONT}:textfile={txtfile}:expansion=none:fontsize={fs}:fontcolor={color}:"
             f"borderw={border}:bordercolor=black@0.85:shadowx=2:shadowy=3:shadowcolor=black@0.55:"
-            f"x=(w-text_w)/2:y={y_expr}:enable='{enable}'")
+            f"x={x_expr}:y={y_expr}:enable='{enable}'")
 
 
-def render_clip(tag, sc, img, d, voice=None):
-    """Видео-кадр: картинка на весь экран с плавным движением, слова по одному, карточка сверху."""
+def render_clip_basic(tag, sc, img, d):
+    """Простой монтаж (MOTION=false): картинка на весь экран, плавный наезд, слова по одному, карточка сверху."""
     total = d + OVERLAP
     frames = int(total * FPS) + 2
     rnd = random.Random(tag)
@@ -1762,7 +1455,7 @@ def render_clip(tag, sc, img, d, voice=None):
     if sc.get("sfx") in ("hit", "boom", "shot"):   # вспышка на ударе
         vf.append("format=yuv420p,fade=t=in:st=0:d=0.10:color=white")
 
-    for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []), voice)):
+    for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []))):
         f = WORK / f"{tag}_w{i}.txt"
         f.write_text(w, encoding="utf-8")
         vf.append(_drawtext(f, fit_size(w, 66, W * 0.94 / 1.35, 34), RED if hot else "white",
@@ -1778,6 +1471,178 @@ def render_clip(tag, sc, img, d, voice=None):
     out = WORK / f"{tag}_clip.mp4"
     run(["ffmpeg", "-y", "-i", str(img), "-vf", ",".join(vf) + ",format=yuv420p", "-t", f"{total:.2f}",
          "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-an", str(out)])
+    return out
+
+
+# ───────────── моушен-графика ─────────────
+
+def make_fx_assets():
+    """Один раз за запуск рисует служебные картинки: линии скорости и мягкие затемнения под текст."""
+    from PIL import Image, ImageDraw
+    import math
+    a = WORK / "fx_speed.png"
+    if not a.exists():
+        im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        r = random.Random(7)
+        cx, cy = W / 2, H * 0.5
+        for _ in range(140):
+            ang = r.uniform(0, 2 * math.pi)
+            r0 = r.uniform(0.42, 0.62) * H * 0.5 * 2
+            r1 = r0 + r.uniform(0.25, 0.55) * H
+            w = r.uniform(2, 9)
+            ox, oy = math.cos(ang), math.sin(ang)
+            nx, ny = -oy * w / 2, ox * w / 2
+            p0 = (cx + ox * r0, cy + oy * r0)
+            p1 = (cx + ox * r1, cy + oy * r1)
+            d.polygon([(p0[0] + nx, p0[1] + ny), (p0[0] - nx, p0[1] - ny), p1], fill=(255, 255, 255, 215))
+        im.save(a)
+    gt, gb = WORK / "fx_grad_top.png", WORK / "fx_grad_bot.png"
+    if not gt.exists():
+        for path, fn in ((gt, lambda t: 0.50 * (1 - t / 0.34) if t < 0.34 else 0.0),
+                         (gb, lambda t: 0.34 * math.sin(math.pi * (t - 0.50) / 0.38) if 0.50 < t < 0.88 else 0.0)):
+            im = Image.new("RGBA", (1, H), (0, 0, 0, 0))
+            px = im.load()
+            for y in range(H):
+                px[0, y] = (0, 0, 0, int(255 * fn(y / H)))
+            im.resize((W, H)).save(path)
+    return a, gt, gb
+
+
+def person_layer(img, tag):
+    """Герой, вырезанный из УЖЕ ГОТОВОГО кадра (отдельно героя и сцену не генерируем). None - если вырезка нехорошая."""
+    if OFFLINE and not ENV("TEST_PARALLAX"):
+        return None
+    try:
+        from PIL import Image, ImageFilter
+        out = WORK / f"{tag}_fg.png"
+        cutout(img, out)
+        im = Image.open(out).convert("RGBA")
+        al = im.getchannel("A")
+        small = list(al.resize((64, 114)).tobytes())
+        cov = sum(1 for v in small if v > 128) / len(small)
+        if cov < 0.06 or cov > 0.72:         # вырезалось слишком мало или почти весь кадр
+            return None
+        al = al.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(1.6))
+        im.putalpha(al)
+        im.save(out)
+        return out
+    except Exception as e:  # noqa
+        log(f"объём для {tag} пропущен: {str(e)[:120]}")
+        return None
+
+
+def typewriter(tag, idx, line, size, color, y, t0, cps=22.0):
+    """Строка «печатается» с мигающим курсором: слой на каждый шаг, x фиксирован по ширине полной строки."""
+    n = len(line)
+    step = max(1, n // 16)
+    x = int((W - text_w(line, size)) / 2)
+    out, k = [], 0
+    while k < n:
+        k = min(n, k + step)
+        txt = line[:k] + ("|" if k < n else "")
+        a = t0 + (k - step) / cps
+        b = (t0 + k / cps) if k < n else 99
+        f = WORK / f"{tag}_t{idx}_{k}.txt"
+        f.write_text(txt, encoding="utf-8")
+        out.append(_drawtext(f, size, color, str(y), f"gte(t,{a:.2f})*lt(t,{b:.2f})", 6, None, str(x)))
+        if k >= n:
+            break
+    return out
+
+
+def render_clip(tag, sc, img, d, fg=None):
+    """Кадр с моушен-графикой: движение камеры, объём (герой из кадра), вспышка и тряска на ударах,
+    линии скорости, цветокор и виньетка, затемнение под текст, слова с эффектом, карточка «печатается»."""
+    if not MOTION:
+        return render_clip_basic(tag, sc, img, d)
+    speed_png, grad_top, grad_bot = make_fx_assets()
+    total = d + OVERLAP
+    frames = int(total * FPS) + 2
+    rnd = random.Random(tag)
+    impact = sc.get("sfx") in ("hit", "boom", "shot")
+    action = impact or sc.get("sfx") == "whoosh" and rnd.random() < 0.5
+    kind = "in" if fg else rnd.choice(["in", "in", "punch", "handheld", "out", "pan_l", "pan_r"])
+    cx, cy = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    shx = "+34*sin(on*1.9)*max(0,1-on/10)" if impact else ""
+    shy = "+24*cos(on*2.3)*max(0,1-on/10)" if impact else ""
+    if kind == "in":
+        z, x, y = (f"1+0.04*on/{frames}" if fg else f"1+0.10*on/{frames}"), cx + shx, cy + shy
+    elif kind == "punch":
+        z, x, y = f"1.16-0.10*min(on/9,1)+0.05*on/{frames}", cx + shx, cy + shy
+    elif kind == "handheld":
+        z, x, y = "1.07", f"{cx}+22*sin(on/9)+9*sin(on/3.1){shx}", f"{cy}+16*sin(on/7+1)+6*sin(on/2.7){shy}"
+    elif kind == "out":
+        z, x, y = f"1.10-0.10*on/{frames}", cx + shx, cy + shy
+    elif kind == "pan_l":
+        z, x, y = "1.08", f"(iw-iw/zoom)*(0.85-0.7*on/{frames}){shx}", cy + shy
+    else:
+        z, x, y = "1.08", f"(iw-iw/zoom)*(0.15+0.7*on/{frames}){shx}", cy + shy
+
+    cmd = ["ffmpeg", "-y", "-i", str(img)]
+    n_in = 1
+    if fg:
+        cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{total:.2f}", "-i", str(fg)]
+        n_in += 1
+    cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{total:.2f}", "-i", str(grad_bot)]
+    i_grad = n_in
+    n_in += 1
+    i_top = None
+    if sc.get("card"):
+        cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{total:.2f}", "-i", str(grad_top)]
+        i_top = n_in
+        n_in += 1
+    i_speed = None
+    if action:
+        cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{total:.2f}", "-i", str(speed_png)]
+        i_speed = n_in
+        n_in += 1
+
+    fc = [f"[0:v]scale=2160:3840,zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS}"
+          + (",gblur=sigma=3" if fg else "") + ",format=yuv420p[bg]"]
+    cur = "bg"
+    if fg:   # герой растёт быстрее фона: в начале совпадает с ним, поэтому «двойного» героя нет
+        fc.append(f"[1:v]format=rgba,scale=w='trunc({W}*(1+0.13*t/{total:.2f})/2)*2':"
+                  f"h='trunc({H}*(1+0.13*t/{total:.2f})/2)*2':eval=frame[fgz]")
+        fc.append(f"[bg][fgz]overlay=x='(W-w)/2':y='(H-h)/2':eval=frame:format=auto,format=yuv420p[ov]")
+        cur = "ov"
+    look = ("hue=s=0,eq=contrast=1.25:brightness=-0.03,noise=alls=14:allf=t,vignette=angle=PI/4"
+            if sc.get("flashback") else "eq=contrast=1.05:saturation=1.12,vignette=angle=PI/5")
+    chain = [look]
+    if impact:
+        chain += ["fade=t=in:st=0:d=0.10:color=white", "rgbashift=rh=9:bh=-9:enable='lt(t,0.16)'"]
+    fc.append(f"[{cur}]" + ",".join(chain) + ",format=yuv420p[lk]")
+    cur = "lk"
+    if i_speed is not None:
+        fc.append(f"[{i_speed}:v]format=rgba,colorchannelmixer=aa=0.55[spd]")
+        fc.append(f"[{cur}][spd]overlay=0:0:enable='lt(mod(t,0.14),0.07)',format=yuv420p[sp]")
+        cur = "sp"
+    fc.append(f"[{i_grad}:v]format=rgba[gr]")
+    fc.append(f"[{cur}][gr]overlay=0:0,format=yuv420p[sh]")
+    cur = "sh"
+    if i_top is not None:
+        fc.append(f"[{i_top}:v]format=rgba[gt]")
+        fc.append(f"[{cur}][gt]overlay=0:0,format=yuv420p[sh2]")
+        cur = "sh2"
+
+    texts = []
+    for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []))):
+        f = WORK / f"{tag}_w{i}.txt"
+        f.write_text(w, encoding="utf-8")
+        base = int(66 * 1.12) if hot else 66          # ключевое слово крупнее и красное
+        texts.append(_drawtext(f, fit_size(w, base, W * 0.94 / 1.35, 34), RED if hot else "white",
+                               "h*0.63-text_h/2", f"between(t,{a:.2f},{b:.2f})", pop_at=a))
+    card = sc.get("card")
+    if card:
+        y0, t0 = int(H * 0.09), 0.12
+        for i, (line, size, is_red) in enumerate(card_layout(card["lines"], card["red"])):
+            texts += typewriter(tag, i, line, size, RED if is_red else "white", y0, t0)
+            t0 += len(line) / 22.0 + 0.12
+            y0 += int(size * 1.22)
+    fc.append(f"[{cur}]" + ",".join(texts or ["null"]) + ",format=yuv420p[v]")
+    out = WORK / f"{tag}_clip.mp4"
+    run(cmd + ["-filter_complex", ";".join(fc), "-map", "[v]", "-t", f"{total:.2f}", "-r", str(FPS),
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "17", "-an", str(out)])
     return out
 
 
@@ -1807,7 +1672,30 @@ def music_input(total):
     return ["-f", "lavfi", "-t", f"{total:.1f}", "-i", f"aevalsrc='{expr}':s=44100:c=stereo"]
 
 
-def assemble(clips, audios, durs, out):
+WHOOSH_TRANS = {"zoomin", "slideleft", "slideright", "wipeleft", "wiperight", "hblur", "smoothleft",
+                "smoothright", "distance", "squeezeh", "circleopen", "radial"}
+
+
+def pick_transitions(n, scenes, rnd):
+    """Переходы по смыслу: на удар вспышка, флешбэк плавно через серый, остальные разные и без повторов подряд."""
+    pool = ["fade", "zoomin", "slideleft", "slideright", "wipeleft", "wiperight", "circleopen", "radial",
+            "pixelize", "distance", "vuslice", "hblur", "smoothleft", "smoothright", "squeezeh"]
+    out, prev = [], None
+    for k in range(1, n):
+        a = scenes[k - 1] if scenes and k - 1 < len(scenes) else {}
+        b = scenes[k] if scenes and k < len(scenes) else {}
+        if b.get("sfx") in ("hit", "boom", "shot"):
+            t = rnd.choice(["fadewhite", "hblur", "zoomin"])
+        elif bool(a.get("flashback")) != bool(b.get("flashback")):
+            t = "fadegrays"
+        else:
+            t = rnd.choice([x for x in pool if x != prev])
+        out.append(t)
+        prev = t
+    return out
+
+
+def assemble(clips, audios, durs, out, scenes=None):
     n = len(clips)
     total_audio = sum(durs)
     total = total_audio + OVERLAP
@@ -1816,22 +1704,49 @@ def assemble(clips, audios, durs, out):
     voice = WORK / "voice_all.wav"
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(vlist), "-c", "copy", str(voice)])
 
-    trans = ["fade", "zoomin", "slideleft", "slideright", "wipeleft", "wiperight", "circleopen",
-             "radial", "pixelize", "distance", "vuslice", "fadefast"]
     rnd = random.Random(n)
-    fc, prev, off = [], "0:v", 0.0
+    trans = pick_transitions(n, scenes, rnd) if MOTION else \
+        [rnd.choice(["fade", "zoomin", "slideleft", "slideright", "wipeleft", "wiperight", "circleopen",
+                     "radial", "pixelize", "distance", "vuslice", "fadefast"]) for _ in range(max(n - 1, 0))]
+    fc, prev, off, whoosh_at = [], "0:v", 0.0, []
     for k in range(1, n):
         off += durs[k - 1]
-        fc.append(f"[{prev}][{k}:v]xfade=transition={rnd.choice(trans)}:duration={OVERLAP}:offset={off:.2f}[x{k}]")
+        fc.append(f"[{prev}][{k}:v]xfade=transition={trans[k - 1]}:duration={OVERLAP}:offset={off:.2f}[x{k}]")
         prev = f"x{k}"
+        if MOTION and trans[k - 1] in WHOOSH_TRANS and k % 2 == 1:      # свист не на каждом переходе
+            whoosh_at.append(max(off - 0.04, 0))
     cmd = ["ffmpeg", "-y"]
     for c in clips:
         cmd += ["-i", str(c)]
     cmd += ["-i", str(voice)] + music_input(total)
     iv, im = n, n + 1
-    fc.append(f"[{iv}:a]apad=pad_dur={OVERLAP + 0.5}[vo]")
-    fc.append(f"[{im}:a]volume=0.16,afade=t=in:d=1.5,afade=t=out:st={max(total - 2, 0):.1f}:d=2[mu]")
-    fc.append("[vo][mu]amix=inputs=2:duration=first:dropout_transition=0,volume=2,"
+    nxt = n + 2
+    m_w = len(whoosh_at)
+    if m_w:
+        cmd += ["-f", "lavfi", "-t", "0.6", "-i", "anoisesrc=d=0.6:c=pink:r=44100"]
+        iw = nxt
+        nxt += 1
+    fc.append(f"[{iv}:a]apad=pad_dur={OVERLAP + 0.5}[vo0]")
+    if MOTION:
+        fc.append("[vo0]asplit=2[vo][vsc]")
+        fc.append(f"[{im}:a]volume=0.20,afade=t=in:d=1.5,afade=t=out:st={max(total - 2, 0):.1f}:d=2[mu0]")
+        fc.append("[mu0][vsc]sidechaincompress=threshold=0.04:ratio=9:attack=20:release=300[mu]")   # музыка тише под голосом
+    else:
+        fc.append("[vo0]anull[vo]")
+        fc.append(f"[{im}:a]volume=0.16,afade=t=in:d=1.5,afade=t=out:st={max(total - 2, 0):.1f}:d=2[mu]")
+    mix_in = "[vo][mu]"
+    n_mix = 2
+    if m_w:
+        fc.append("[%d:a]highpass=f=400,lowpass=f=6000,afade=t=in:d=0.18,afade=t=out:st=0.18:d=0.40,"
+                  "aformat=sample_rates=44100:channel_layouts=stereo,asplit=%d%s" %
+                  (iw, m_w, "".join(f"[w{i}]" for i in range(m_w))))
+        for i, t in enumerate(whoosh_at):
+            ms = int(t * 1000)
+            fc.append(f"[w{i}]adelay={ms}|{ms}[d{i}]")
+        fc.append("".join(f"[d{i}]" for i in range(m_w)) + f"amix=inputs={m_w}:duration=longest,volume={m_w * 0.30:.2f}[wh]")
+        mix_in += "[wh]"
+        n_mix = 3
+    fc.append(f"{mix_in}amix=inputs={n_mix}:duration=first:dropout_transition=0,volume={n_mix},"
               "loudnorm=I=-14:TP=-1.5:LRA=9[a]")
     vmap = f"[{prev}]" if n > 1 else "[0:v]"
     run(cmd + ["-filter_complex", ";".join(fc), "-map", vmap, "-map", "[a]", "-t", f"{total:.2f}",
@@ -2195,7 +2110,7 @@ def cmd_create():
                     story = claude_json(build_script_prompt(facts, cast, "claude"))
                     log(f"сценарий написал Claude ({CLAUDE_MODEL})")
                 except Exception as e:  # noqa
-                    notify(f"ℹ️ Claude недоступен ({str(e)[:200]}). Сценарий пишет Gemini.")
+                    (log if "402" in str(e) else notify)(f"ℹ️ Claude недоступен ({str(e)[:200]}). Сценарий пишет Gemini.")
             if story is None:
                 story = gemini(build_script_prompt(facts, cast), models=GEMINI_SCRIPT_MODELS)
         else:
@@ -2206,8 +2121,6 @@ def cmd_create():
         for c in story.get("cast") or []:
             ensure_character(c["name"], c["description"], cast, portrait=not photo,
                              ref=photo and CHAR_REF, face=story_mode and INSTANTID)
-        if story_mode and not OFFLINE:
-            rewrite_image_prompts(story, cast)
         if not photo:
             for c in list(cast.values()):
                 ensure_character(c["name"], c["description"], cast, portrait=True)
@@ -2219,7 +2132,7 @@ def cmd_create():
 
         parts, clips, audios, durs = [], [], [], []
         voices = make_all_voices(story["scenes"]) if story_mode else None
-        last_img, img_fail, recent, photos_used = None, 0, [], 0
+        last_img, img_fail, recent, parallax_n = None, 0, [], 0
         for i, sc in enumerate(story["scenes"]):
             tag = f"s{i:02d}"
             log(f"сцена {i + 1}/{len(story['scenes'])}: {sc['narration']}")
@@ -2242,38 +2155,17 @@ def cmd_create():
                         if c0 and (c0["dir"] / "face.png").exists():
                             face = c0["dir"] / "face.png"
                             break
-                used_photo = False
-                if PHOTOS_ON and sc.get("photo_query") and photos_used < MAX_PHOTOS and not OFFLINE:
-                    try:
-                        credit = real_photo(sc, img)
-                    except Exception as e:  # noqa
-                        credit = None
-                        log("реальное фото не вышло:", str(e)[:120])
-                    if credit:
-                        used_photo = True
-                        photos_used += 1
-                        sources.append(credit)
-                        log(f"сцена {i + 1}: реальное фото ({sc['photo_query']})")
                 base_prompt = expand_prompt(sc["image_prompt"], cast) + extra + ", no text, no letters, no watermark"
                 try:
-                    if not used_photo:
-                        gen_image("vscene", base_prompt, img, seed, refs or None, face=face, init=init_ref,
-                                  strength=min(0.95, IMG2IMG_STRENGTH + (-0.05, 0.0, 0.05)[i % 3]))
-                        if is_repeat(img, recent):
-                            log(f"кадр {i + 1} похож на предыдущие, рисую заново в другом ракурсе")
-                            try:
-                                gen_image("vscene", base_prompt + ", " + SHOTS[i % len(SHOTS)], img, seed + 7919,
-                                          refs or None, face=face, init=init_ref, strength=0.93)
-                            except RuntimeError:
-                                pass        # оставляем первый вариант
-                        prob = frame_problem(img)
-                        if prob:
-                            log(f"кадр {i + 1}: {prob}, рисую заново без устройств")
-                            try:
-                                gen_image("vscene", strip_devices(base_prompt) + ", wide cinematic shot of people and landscape",
-                                          img, seed + 4241, refs or None, face=face, init=init_ref, strength=0.9)
-                            except RuntimeError:
-                                pass
+                    gen_image("vscene", base_prompt, img, seed, refs or None, face=face, init=init_ref,
+                              strength=min(0.95, IMG2IMG_STRENGTH + (-0.05, 0.0, 0.05)[i % 3]))
+                    if is_repeat(img, recent):
+                        log(f"кадр {i + 1} похож на предыдущие, рисую заново в другом ракурсе")
+                        try:
+                            gen_image("vscene", base_prompt + ", " + SHOTS[i % len(SHOTS)], img, seed + 7919, refs or None,
+                                      face=face, init=init_ref, strength=0.93)
+                        except RuntimeError:
+                            pass        # оставляем первый вариант
                 except RuntimeError as e:
                     if last_img is None or img_fail > max(4, int(len(story["scenes"]) * 0.4)):
                         raise
@@ -2291,7 +2183,12 @@ def cmd_create():
                     voice = WORK / f"{tag}.mp3"
                     make_voice(sc["narration"], voice)
                 d = round(max(1.4, duration(voice) + 0.06), 2)
-                clips.append(render_clip(tag, sc, img, d, voice))
+                fg = None
+                if (PARALLAX and MOTION and re.search(r"\[[^\]]+\]", sc["image_prompt"])
+                        and sum(map(ord, tag)) % 100 < 55 and parallax_n < max(1, int(len(story["scenes"]) * 0.45))):
+                    fg = person_layer(img, tag)        # герой вырезается из готового кадра, а не генерируется отдельно
+                    parallax_n += 1 if fg else 0
+                clips.append(render_clip(tag, sc, img, d, fg=fg))
                 audios.append(scene_audio(tag, sc, voice, d))
                 durs.append(d)
                 continue
@@ -2326,7 +2223,7 @@ def cmd_create():
         if story_mode and img_fail:
             notify(f"⚠️ Не удалось нарисовать картинок: {img_fail}. Вместо них использованы соседние кадры.")
         if story_mode:
-            assemble(clips, audios, durs, final)
+            assemble(clips, audios, durs, final, story["scenes"])
         else:
             concat(parts, final)
     except NoStory as e:
@@ -2357,14 +2254,9 @@ def cmd_create():
                          {"text": "✅ Опубликовать", "callback_data": f"pub:{vid}"},
                          {"text": "🗑 Отклонить", "callback_data": f"rej:{vid}"}]]})
         v["tg_file_id"] = msg["video"]["file_id"]
-        facts_src = [x for x in sources if not str(x.get("title", "")).startswith("Фото:")]
-        photo_src = [x for x in sources if str(x.get("title", "")).startswith("Фото:")]
-        if facts_src:
-            lines = "\n".join(f"- {x['title'] or 'источник'}: {x['url']}" for x in facts_src[:6])
+        if sources:
+            lines = "\n".join(f"- {x['title'] or 'источник'}: {x['url']}" for x in sources[:6])
             notify("Проверь факты перед публикацией. Источники:\n" + lines)
-        if photo_src:
-            lines = "\n".join(f"- {x['title'][6:]}: {x['url']}" for x in photo_src)
-            notify("В ролике реальные фото. При публикации укажи авторов, если лицензия этого требует (CC BY):\n" + lines)
     save_video(v)
 
     if AUTO_PUBLISH and IG_TOKEN:
