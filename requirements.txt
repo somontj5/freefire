@@ -5,3 +5,4 @@ onnxruntime
 pillow
 gradio_client
 faster-whisper
+numpy
