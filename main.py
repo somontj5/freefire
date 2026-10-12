@@ -136,11 +136,18 @@ FONT_CANDIDATES = ["/usr/share/fonts/truetype/montserrat/Montserrat-Bold.ttf",
                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
 FONT = next((f for f in FONT_CANDIDATES if os.path.exists(f)), FONT_CANDIDATES[-1])
 SERIES_CARD = [x.strip() for x in (ENV("SERIES_CARD") or "ИСТОРИЯ|ЗА ОДНУ МИНУТУ").split("|") if x.strip()]
-STYLE_STORY = ("detailed digital comic illustration, semi-realistic, cinematic lighting, rich colors, "
-               "vertical 9:16 composition, no text")
+PIXEL_ART = (ENV("PIXEL_ART") or "1") != "0"
+ART_STYLE = (ENV("ART_STYLE") or "").strip()      # свой стиль целиком, например "watercolor illustration"
+STYLE_STORY = ART_STYLE or (
+    "pixel art illustration, 16-bit retro game style, crisp square pixels, limited color palette, flat colors "
+    "with simple dithering, chunky pixel sprites, clean pixel outlines, no film grain, no noise, "
+    "vertical 9:16 composition, no text" if PIXEL_ART else
+    "detailed digital comic illustration, semi-realistic, cinematic lighting, rich colors, "
+    "vertical 9:16 composition, no text")
 OVERLAP = 0.25      # длина перехода между кадрами, сек
 RED = "0xE0101A"
-STYLE = "stylized 3D cartoon game art, vibrant colors, clean shapes, battle royale setting"
+STYLE = ART_STYLE or ("pixel art, 16-bit retro game style, crisp square pixels, limited color palette, battle royale setting"
+                     if PIXEL_ART else "stylized 3D cartoon game art, vibrant colors, clean shapes, battle royale setting")
 
 # SFX генерируются прямо в ffmpeg: (источник, фильтры, задержка в мс)
 SFX = {
@@ -709,6 +716,24 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
     use_horde = IMAGE_PROVIDER in ("horde", "auto") and not refs
     use_cf = IMAGE_PROVIDER in ("cf", "auto") and not refs and bool(CF_ACCOUNTS) and len(_cf_dead) < len(CF_ACCOUNTS)
     errors = []
+
+    def _try_cf():
+        if not (use_cf and len(_cf_dead) < len(CF_ACCOUNTS)):
+            return False
+        try:
+            cloudflare_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed, vsize(vertical))
+            return True
+        except HFQuota as e:
+            errors.append(f"cloudflare: {str(e)[:100]}")
+            quota_note("cf", "ℹ️ Дневной лимит Cloudflare исчерпан на всех аккаунтах. Дальше Hugging Face, Pollinations и Horde.")
+        except Exception as e:  # noqa
+            errors.append(f"cloudflare: {str(e)[:160]}")
+            log(f"Cloudflare: {str(e)[:200]}")
+        return False
+
+    # Cloudflare первым. У сцен с образцом героя сначала Hugging Face (img2img или InstantID держат лицо), Cloudflare после
+    if not ((init and CHAR_REF) or (face and INSTANTID)) and _try_cf():
+        return
     if init and CHAR_REF and IMAGE_PROVIDER in ("hf", "auto") and IMG2IMG_SPACE not in _hf["dead"]:
         try:       # новая сцена по образцу героя: одежда и внешность сохраняются
             hf_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed,
@@ -746,16 +771,8 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
                 log(f"{space}: {str(e)[:200]}")
                 if space in _hf["dead"]:
                     quota_note(("dead", space), f"ℹ️ Space {space.split('/')[-1]} исключён на этот запуск: {str(e)[:220]}")
-    if use_cf:
-        try:
-            cloudflare_generate(f"{prompt}, {STYLE_STORY if vertical else STYLE}", path, seed, vsize(vertical))
-            return
-        except HFQuota as e:
-            errors.append(f"cloudflare: {str(e)[:100]}")
-            quota_note("cf", "ℹ️ Дневной лимит Cloudflare исчерпан на всех аккаунтах. Дальше Pollinations и Horde.")
-        except Exception as e:  # noqa
-            errors.append(f"cloudflare: {str(e)[:160]}")
-            log(f"Cloudflare: {str(e)[:200]}")
+    if _try_cf():
+        return
     if use_poll and not _hf["poll_dead"]:
         try:
             if vertical:
@@ -1519,7 +1536,7 @@ def clean_image_prompt(prompt):
     out = _tidy(", ".join(clauses))
     if len(out.split()) < 5:                     # почти всё выкинули: безопасная замена, герой из скобок остаётся
         names = re.findall(r"\[[^\]]*\]", prompt)
-        out = (names[0] if names else "A young man") + " stands in a cinematic wide shot, dramatic lighting, detailed comic illustration"
+        out = (names[0] if names else "A young man") + " stands in a cinematic wide shot, dramatic lighting, detailed " + ("pixel art" if PIXEL_ART else "comic") + " illustration"
     return out
 
 
@@ -1787,6 +1804,15 @@ def make_vertical(data, out):
     bg.save(out)
 
 
+def pixelate_file(path, cols=160):
+    """Реальное фото в пиксель-арт: крупные квадраты и мало цветов, чтобы не выбивалось из рисованных кадров."""
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    w, h = im.size
+    small = im.resize((cols, max(1, round(h * cols / w))), Image.BOX).quantize(colors=40, dither=0).convert("RGB")
+    small.resize((w, h), Image.NEAREST).save(path)
+
+
 def real_photo(sc, out):
     """Ищет свободное фото под фразу сцены, Gemini смотрит и решает, подходит ли. Возвращает источник или None."""
     cands = [c for c in photo_candidates(sc["photo_query"]) if c["url"] not in _used_photos and c["url"] not in _rejected_photos][:5]
@@ -1810,6 +1836,8 @@ def real_photo(sc, out):
             return None
         if verdict.get("ok") is True:
             make_vertical(data, out)
+            if PIXEL_ART:
+                pixelate_file(out)
             _used_photos.add(c["url"])
             return {"title": f"Фото: {c['title'][:70]}, {c['artist'][:40]}, {c['license']}", "url": c["page"] or c["url"]}
         _rejected_photos.add(c["url"])
@@ -1983,7 +2011,7 @@ def render_clip_basic(tag, sc, img, d, voice=None):
         z, x, y = "1.08", f"(iw-iw/zoom)*(0.15+0.7*on/{frames})", "ih/2-(ih/zoom/2)"
     vf = [f"scale=2160:3840,zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS}"]
     if sc.get("flashback"):      # сцены из прошлого: чёрно-белые с зерном
-        vf.append("hue=s=0,eq=contrast=1.25:brightness=-0.03,noise=alls=14:allf=t")
+        vf.append("hue=s=0,eq=contrast=1.25:brightness=-0.03,noise=alls=6:allf=t")
     if sc.get("sfx") in ("hit", "boom", "shot"):   # вспышка на ударе
         vf.append("format=yuv420p,fade=t=in:st=0:d=0.10:color=white")
 
@@ -2008,7 +2036,7 @@ def render_clip_basic(tag, sc, img, d, voice=None):
 
 def _fx():
     import fx
-    fx.init(W=W, H=H, FPS=FPS, OVERLAP=OVERLAP, FONT=FONT, RED=RED, WORK=WORK, text_w=text_w, log=log, run=run)
+    fx.init(W=W, H=H, FPS=FPS, OVERLAP=OVERLAP, FONT=FONT, RED=RED, WORK=WORK, text_w=text_w, log=log, run=run, PIXEL=PIXEL_ART)
     return fx
 
 
@@ -2036,7 +2064,7 @@ def render_clip(tag, sc, img, d, voice=None, plan=None, prev_img=None, cut=None)
     src = fx.camera_extras(ch, src, plan, total)
     post = []
     if sc.get("flashback"):      # сцены из прошлого: чёрно-белые с зерном
-        post.append("hue=s=0,eq=contrast=1.25:brightness=-0.03,noise=alls=14:allf=t")
+        post.append("hue=s=0,eq=contrast=1.25:brightness=-0.03" + ("" if PIXEL_ART else ",noise=alls=6:allf=t"))
     if sc.get("sfx") in ("hit", "boom", "shot"):   # вспышка на ударе
         post.append("format=yuv420p,fade=t=in:st=0:d=0.10:color=white")
     if post:
@@ -2159,20 +2187,7 @@ def assemble(clips, audios, durs, out, trans=None, sfx_track=None, music=None):
 
 # ───────────────────────── Instagram ─────────────────────────
 
-def ig_publish(video_bytes, caption):
-    if not (IG_USER and IG_TOKEN):
-        raise RuntimeError("Instagram не настроен (нет IG_USER_ID / IG_ACCESS_TOKEN)")
-    r = requests.post(f"{FB}/{IG_USER}/media", data={
-        "media_type": "REELS", "upload_type": "resumable",
-        "caption": caption[:2200], "access_token": IG_TOKEN}, timeout=60)
-    j = r.json()
-    if "id" not in j:
-        raise RuntimeError(f"Instagram создание контейнера: {j}. Отправь боту /igtest, он покажет причину.")
-    cid = j["id"]
-    up = requests.post(f"https://rupload.facebook.com/ig-api-upload/v21.0/{cid}", data=video_bytes, headers={
-        "Authorization": f"OAuth {IG_TOKEN}", "offset": "0", "file_size": str(len(video_bytes))}, timeout=600)
-    if not up.ok:
-        raise RuntimeError(f"Instagram загрузка файла: {up.text[:300]}")
+def _ig_wait_and_publish(cid):
     for _ in range(60):
         st = requests.get(f"{FB}/{cid}", params={"fields": "status_code,status", "access_token": IG_TOKEN},
                           timeout=60).json()
@@ -2189,6 +2204,40 @@ def ig_publish(video_bytes, caption):
     if "id" not in pub:
         raise RuntimeError(f"Instagram публикация: {pub}")
     return pub["id"]
+
+
+def ig_publish(video_bytes, caption, video_url=None):
+    """Сначала загрузка файла напрямую (resumable). Если Instagram её не принимает, например просит video_url,
+    публикуем по ссылке на ролик в GitHub Releases: Instagram скачивает его сам (репозиторий должен быть публичным)."""
+    if not (IG_USER and IG_TOKEN):
+        raise RuntimeError("Instagram не настроен (нет IG_USER_ID / IG_ACCESS_TOKEN)")
+    problem = None
+    try:
+        r = requests.post(f"{FB}/{IG_USER}/media", data={
+            "media_type": "REELS", "upload_type": "resumable",
+            "caption": caption[:2200], "access_token": IG_TOKEN}, timeout=60)
+        j = r.json()
+        if "id" not in j:
+            raise RuntimeError(f"создание контейнера: {j}")
+        cid = j["id"]
+        up = requests.post(f"https://rupload.facebook.com/ig-api-upload/v21.0/{cid}", data=video_bytes, headers={
+            "Authorization": f"OAuth {IG_TOKEN}", "offset": "0", "file_size": str(len(video_bytes))}, timeout=600)
+        if not up.ok:
+            raise RuntimeError(f"загрузка файла: {up.text[:300]}")
+        return _ig_wait_and_publish(cid)
+    except RuntimeError as e:
+        problem = str(e)
+        if not video_url:
+            raise RuntimeError(f"Instagram {problem}. Отправь боту /igtest, он покажет причину.")
+        log("Instagram: прямая загрузка не вышла, пробую по ссылке:", problem[:200])
+    r = requests.post(f"{FB}/{IG_USER}/media", data={
+        "media_type": "REELS", "video_url": video_url, "caption": caption[:2200], "access_token": IG_TOKEN}, timeout=60)
+    j = r.json()
+    if "id" not in j:
+        raise RuntimeError(f"Instagram: прямая загрузка ({problem[:160]}); по ссылке: {j}. "
+                           "Если репозиторий приватный, Instagram не сможет скачать ролик по ссылке. "
+                           "Отправь боту /igtest, он покажет причину.")
+    return _ig_wait_and_publish(j["id"])
 
 
 def ig_diagnose():
@@ -2287,7 +2336,7 @@ def stats_report():
 
 
 def publish_video(v, data):
-    media_id = ig_publish(data, v["caption"])
+    media_id = ig_publish(data, v["caption"], v.get("video_url"))
     v["status"] = "published"
     v["ig_media_id"] = media_id
     v["published"] = now_iso()
