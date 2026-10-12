@@ -45,7 +45,7 @@ def plan_all(scenes, seed):
         elif r.random() < 0.08:
             p["speed"] = True
         p["rack"] = (i == 0) or r.random() < 0.2
-        p["halftone"] = bool(sc.get("flashback")) or r.random() < 0.12
+        p["halftone"] = (bool(sc.get("flashback")) or r.random() < 0.12) and not C.get("PIXEL")
         text = str(sc.get("narration", "")).lower()
         if (i > 0 and splits < 2 and not sc.get("card") and not p["burst"]
                 and re.search(r"(^|\s)(но|зато|вместо|а теперь|а сейчас|раньше|потом)(\s|,)", text) and r.random() < 0.7):
@@ -151,10 +151,15 @@ def _cam(cam, frames, layer=None):
     return f"{z}", f"(iw-iw/zoom)*({lo:.3f}+{amp}*on/{frames})", cy
 
 
+def _sc(w, h):
+    """scale; в пиксель-арте ближайший сосед, чтобы квадраты оставались резкими при увеличении."""
+    return f"scale={w}:{h}" + (":flags=neighbor" if C.get("PIXEL") else "")
+
+
 def base_still(ch, idx, plan, frames):
     W, H, FPS = C["W"], C["H"], C["FPS"]
     z, x, y = _cam(plan["cam"], frames)
-    return ch.f(f"{idx}:v", f"scale=2160:3840,zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS}")
+    return ch.f(f"{idx}:v", f"{_sc(2160, 3840)},zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS}")
 
 
 def base_parallax(ch, bg_i, fg_i, mask_i, plan, frames):
@@ -175,7 +180,7 @@ def base_split(ch, top_i, bot_i, gutter_i, frames):
     ph = (C["H"] - 20) // 2
 
     def panel(i, z):
-        return ch.f(f"{i}:v", f"scale=2160:3840,crop=2160:{ph * 2}:0:{(3840 - ph * 2) // 2},"
+        return ch.f(f"{i}:v", f"{_sc(2160, 3840)},crop=2160:{ph * 2}:0:{(3840 - ph * 2) // 2},"
                               f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{ph}:fps={FPS}")
     top = panel(top_i, f"1.10-0.08*on/{frames}")
     bot = panel(bot_i, f"1+0.08*on/{frames}")
@@ -253,10 +258,12 @@ def make_halftone(path):
     maxd = math.hypot(cx, cy)
     for row, y in enumerate(range(0, H + step, step)):
         for x in range(-(step // 2) * (row % 2), W + step, step):
-            k = min(1.0, math.hypot(x - cx, y - cy) / maxd) ** 1.7       # к краям точки крупнее
-            r = step * 0.46 * k
+            k = math.hypot(x - cx, y - cy) / maxd
+            if k < 0.6:                                                  # центр кадра (лица) без точек
+                continue
+            r = step * 0.42 * min(1.0, (k - 0.6) / 0.4) ** 1.3          # к краям точки крупнее
             if r > 1.2:
-                d.ellipse((x - r, y - r, x + r, y + r), fill=(0, 0, 0, 105))
+                d.ellipse((x - r, y - r, x + r, y + r), fill=(0, 0, 0, 85))
     im.save(path)
 
 
