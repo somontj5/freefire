@@ -35,6 +35,11 @@ jobs:
         with:
           path: ~/.u2net
           key: u2net-v1
+      - name: Cache synthesized music
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/freefire_music
+          key: fxmusic-v1
       - name: Cache Whisper model
         uses: actions/cache@v4
         with:
