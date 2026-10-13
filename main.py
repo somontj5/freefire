@@ -50,11 +50,12 @@ MONTAGE = (ENV("MONTAGE") or "1") != "0"
 PARALLAX_ON = (ENV("PARALLAX") or "1") != "0"          # герой вырезается из кадра и двигается отдельно от фона
 MAX_PARALLAX = int(ENV("MAX_PARALLAX") or 10)
 BEAT_SYNC = (ENV("BEAT_SYNC") or "1") != "0"           # смена кадров по долям музыки
-MUSIC_VOL = float(ENV("MUSIC_VOL") or 0.30)
+MUSIC_VOL = float(ENV("MUSIC_VOL") or 0.45)            # громкость музыки относительно голоса (дорожка уже выровнена по громкости)
+MUSIC_MODE = (ENV("MUSIC_MODE") or "mood").lower()     # mood: музыка по настроению сцен, single: один фон на весь ролик
 TIME_BUDGET_MIN = float(ENV("TIME_BUDGET_MIN") or 35)  # после этого тяжёлые эффекты (параллакс) отключаются, чтобы успеть до тайм-аута
 HF_DEAD_HOURS = float(ENV("HF_DEAD_HOURS") or 8)       # сколько часов не трогать токен, у которого кончилась квота
 TOKENS_FILE = ROOT / "data" / "hf_tokens.json"
-RUN = {"t0": time.time(), "fx_fail": 0, "lint": 0}     # счётчики для итогового отчёта
+RUN = {"t0": time.time(), "fx_fail": 0, "lint": 0, "music": ""}     # счётчики для итогового отчёта
 TG_TOKEN = ENV("TG_TOKEN", "")
 TG_CHAT = ENV("TG_CHAT_ID", "")
 IG_USER = ENV("IG_USER_ID", "")
@@ -1748,7 +1749,7 @@ def run_report(story, photos, parallax, redraws, img_fail, beat, claims):
     parts.append(f"перерисовок {redraws}, реальных фото {photos}, параллакс {parallax}")
     if img_fail:
         parts.append(f"сцен без картинки (взяли прошлую): {img_fail}")
-    parts.append("ритм " + (f"{beat[0]} уд/мин" if beat else "нет"))
+    parts.append("музыка: " + RUN["music"] if RUN.get("music") else "ритм " + (f"{beat[0]} уд/мин" if beat else "нет"))
     parts.append("субтитры по Whisper" if _wh["model"] is not None and not _wh["dead"] else "субтитры по длине слов")
     if RUN["lint"]:
         parts.append(f"штампов исправлено {RUN['lint']}")
@@ -1787,6 +1788,11 @@ def rewrite_image_prompts(story, cast):
         if not isinstance(lst, list) or len(lst) != len(scenes) or not all(isinstance(x, str) and len(x) > 15 for x in lst):
             raise ValueError(f"промптов {len(lst) if isinstance(lst, list) else '?'} вместо {len(scenes)}")
         photos = out.get("photos") or [] if isinstance(out, dict) else []
+        moods = out.get("moods") if isinstance(out, dict) else None
+        if isinstance(moods, list) and len(moods) == len(scenes):
+            for sc, m_ in zip(scenes, moods):
+                if str(m_).strip().lower() in ("calm", "tense", "sad", "rise", "epic", "action"):
+                    sc["mood"] = str(m_).strip().lower()
     except Exception as e:  # noqa
         log(f"промпты картинок: второй вызов не удался ({str(e)[:140]}), беру из сценария")
         lst = None
@@ -2121,7 +2127,8 @@ def render_clip_basic(tag, sc, img, d, voice=None):
 
 def _fx():
     import fx
-    fx.init(W=W, H=H, FPS=FPS, OVERLAP=OVERLAP, FONT=FONT, RED=RED, WORK=WORK, text_w=text_w, log=log, run=run, PIXEL=PIXEL_ART)
+    fx.init(W=W, H=H, FPS=FPS, OVERLAP=OVERLAP, FONT=FONT, RED=RED, WORK=WORK, text_w=text_w, log=log, run=run, PIXEL=PIXEL_ART,
+            ROOT=ROOT, MUSIC_CACHE=pathlib.Path.home() / ".cache" / "freefire_music")
     return fx
 
 
@@ -2188,7 +2195,19 @@ def scene_audio(tag, sc, voice, d):
     return out
 
 
-def prepare_music():
+def prepare_music(scenes=None, seed="v"):
+    """Музыка по настроению сцен (секции, переходы, свои треки из music/<настроение>/ или синтез).
+    Если не вышло или MUSIC_MODE=single, один фон на весь ролик."""
+    if scenes and MONTAGE and MUSIC_MODE != "single":
+        try:
+            plan = _fx().plan_music(scenes, seed, WORK)
+            return {"plan": plan}
+        except Exception as e:  # noqa
+            log("музыка по настроению не подготовлена, беру один фон:", str(e)[:140])
+    return prepare_music_single()
+
+
+def prepare_music_single():
     """Фон под голосом. Свой mp3 из music/ (темп определяется) или синтез с мягким пульсом (темп известен)."""
     try:
         fx = _fx()
@@ -2251,7 +2270,7 @@ def assemble(clips, audios, durs, out, trans=None, sfx_track=None, music=None):
         # голос громче всего, музыка тише под голосом (sidechain), свисты и удары на переходах отдельной дорожкой
         fc.append(f"[{iv}:a]apad=pad_dur={OVERLAP + 0.5},asplit=2[vo][vk]")
         fc.append(f"[{im}:a]volume={MUSIC_VOL},afade=t=in:d=1.5,{fade_out}[mu0]")
-        fc.append("[mu0][vk]sidechaincompress=threshold=0.04:ratio=3:attack=15:release=420[mu]")
+        fc.append("[mu0][vk]sidechaincompress=threshold=0.05:ratio=2.5:attack=15:release=420[mu]")
         mix = "[vo][mu]"
         if sf is not None:
             fc.append(f"[{sf}:a]volume=0.9[sf]")
@@ -2624,7 +2643,7 @@ def build_script_prompt(facts, cast, writer="gemini"):
 def cmd_create():
     WORK.mkdir(exist_ok=True)
     vid = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-    RUN.update(t0=time.time(), fx_fail=0, lint=0)
+    RUN.update(t0=time.time(), fx_fail=0, lint=0, music="")
     claim_issues = []
     try:
         refresh_stats()
@@ -2676,14 +2695,18 @@ def cmd_create():
 
         parts, clips, audios, durs = [], [], [], []
         voices = make_all_voices(story["scenes"]) if story_mode else None
-        plans = trans = mus = beat = None
+        plans = trans = mus = beat = plan_m = None
         cum, parallax_used = 0.0, 0
         if story_mode and MONTAGE:
             fxm = _fx()
             plans = fxm.plan_all(story["scenes"], vid)
             trans = fxm.plan_transitions(plans, story["scenes"], vid)
-            mus = prepare_music()
-            if mus and mus.get("bpm") and BEAT_SYNC:
+            mus = prepare_music(story["scenes"], vid)
+            plan_m = mus.get("plan") if mus else None
+            if plan_m:
+                RUN["music"] = " → ".join(fxm.MOOD_RU[sec["mood"]] for sec in plan_m["sections"])
+                log("музыка по настроению: " + RUN["music"])
+            elif mus and mus.get("bpm") and BEAT_SYNC:
                 beat = (mus["bpm"], mus["offset"])
                 log(f"темп музыки {mus['bpm']} уд/мин, смены кадров подгоняются под ритм")
         last_img, img_fail, recent, photos_used, redraws = None, 0, [], 0, 0
@@ -2760,7 +2783,13 @@ def cmd_create():
                     voice = WORK / f"{tag}.mp3"
                     make_voice(sc["narration"], voice)
                 d = round(max(1.4, duration(voice) + 0.06), 2)
-                if beat:
+                if plan_m:
+                    sec = plan_m["sections"][plan_m["of_scene"][i]]
+                    if sec["t0"] is None:
+                        sec["t0"] = cum                # секция начинается с первой сцены, её музыка с первой доли
+                    if BEAT_SYNC and sec["track"]["bpm"]:
+                        d = round(_fx().snap_duration(d, cum, sec["track"]["bpm"], sec["t0"]), 2)
+                elif beat:
                     d = round(_fx().snap_duration(d, cum, beat[0], beat[1]), 2)
                 cum += d
                 cut = None
@@ -2810,14 +2839,22 @@ def cmd_create():
             if plans:
                 try:
                     fxm = _fx()
-                    ev = fxm.sound_events(durs, story["scenes"], plans, trans)
+                    ev = fxm.sound_events(durs, story["scenes"], plans, trans, fxm.music_cuts(plan_m) if plan_m else None)
                     sfx_track = fxm.build_sfx_track(ev, sum(durs) + OVERLAP, WORK, WORK / "sfx_auto.wav")
                 except Exception as e:  # noqa
                     log("свисты и удары на переходах не получились:", str(e)[:140])
                 if parallax_used:
                     log(f"параллакс героя в сценах: {parallax_used}")
+            music_arg = mus
+            if plan_m:
+                try:
+                    bed = _fx().build_music_bed(plan_m, sum(durs) + OVERLAP, WORK, WORK / "music_bed.wav")
+                    music_arg = {"path": bed}
+                except Exception as e:  # noqa
+                    log("склейка музыки не вышла, беру один фон:", str(e)[-200:])
+                    music_arg = prepare_music_single()
             try:
-                assemble(clips, audios, durs, final, trans, sfx_track, mus)
+                assemble(clips, audios, durs, final, trans, sfx_track, music_arg)
             except Exception as e:  # noqa
                 log(f"сборка с новыми переходами и звуком не вышла ({str(e)[-200:]}), собираю по-простому")
                 RUN["fx_fail"] += 1
