@@ -468,7 +468,7 @@ def build_sfx_track(events, total, work, out):
     return out
 
 
-def sound_events(durs, scenes, plans, trans):
+def sound_events(durs, scenes, plans, trans, mcuts=None):
     """Свисты на переходах, удары на вспышках, нарастание перед важным моментом."""
     OV = C["OVERLAP"]
     ev, t, risers = [], 0.0, 0
@@ -485,7 +485,19 @@ def sound_events(durs, scenes, plans, trans):
             if risers < 3 and tt > 1.6:
                 ev.append((max(0.0, tt + OV / 2 - 1.2), "riser", 0.55))
                 risers += 1
-    return ev
+    for t, style in (mcuts or []):             # смена музыки на эпичную или динамичную: нарастание и удар
+        if style == "hit":
+            ev.append((max(0.0, t + OV / 2 - 0.02), "impact", 0.9))
+            if t > 1.4:
+                ev.append((max(0.0, t + OV / 2 - 1.2), "riser", 0.55))
+    ev.sort()
+    out, last = [], {}
+    for e in ev:                                # два одинаковых звука рядом не нужны
+        if e[0] - last.get(e[1], -9) < 0.6:
+            continue
+        last[e[1]] = e[0]
+        out.append(e)
+    return out
 
 
 # ───────────────────────── музыка и ритм ─────────────────────────
@@ -603,3 +615,237 @@ def _cutout_from_alpha(im, alpha, tag, work, lo=0.08, hi=0.62):
     im.save(paths["fg"])
     mask.save(paths["mask"])
     return paths
+
+
+# ───────────────────────── музыка по настроению ─────────────────────────
+# Шесть настроений. Для каждого берётся ваш трек из music/<настроение>/ (mp3, wav, ogg, m4a) или синтезированный
+# фон (все синтезы в темпе 96 уд/мин, 16 тактов = 40 секунд, поэтому петли стыкуются без шва и ритм общий).
+MOODS = ["calm", "tense", "sad", "rise", "epic", "action"]
+MOOD_RU = {"calm": "спокойная", "tense": "тревожная", "sad": "грустная", "rise": "нарастающая",
+           "epic": "эпичная", "action": "динамичная"}
+MOOD_KEYS = {
+    "epic": r"чемпион|побед|выигра|финал|кубок|трофе|титул|миллион|рекорд|мирово|золот|триумф|легенд|вершин|первое место|лучш",
+    "action": r"турнир|матч|бой|сраж|стрел|катк|раунд|атак|десант|выстрел|перестрел|вышл\w* на сцен",
+    "tense": r"страх|боял|угроз|опасн|проигр|пораж|провал|сомнева|не верил|давлен|критик|тревог|тёмн|темн|ставк|"
+             r"последн\w+ шанс|потерял|исключ|выгнал|отказал|трудн|сложн",
+    "sad": r"умер|смерт|слёз|слез|расстал|бедн|нищ|болезн|одинок|плакал|голод|тяжёл|тяжел",
+    "rise": r"решил|начал|мечт|тренир|упор|шаг за шагом|набрал|подписчик|аудитор|первый|первые|поверил|цель|"
+            r"получилось|раскрутил|заметили|приглас|рос\b|расти|выросл",
+    "calm": r"родил|детств|семь|дом|школ|обычн|работал|жил|вырос в|в 19\d\d|в 20\d\d",
+}
+_MBPM, _MPER = 96.0, 60.0 / 96.0
+_MBAR, _MLOOP = 4 * _MPER, 16 * 4 * _MPER
+
+
+def _pick(idx, vals):
+    s = str(vals[-1])
+    for k in range(len(vals) - 2, -1, -1):
+        s = f"if(eq({idx},{k}),{vals[k]},{s})"
+    return s
+
+
+def mood_expr(mood):
+    """Выражение для aevalsrc: одна дорожка настроения на 4 такта в петле."""
+    BI = "mod(floor(t/2.5),4)"
+    BP, BT, E8, EI = "mod(t,2.5)", "mod(t,0.625)", "mod(t,0.3125)", "floor(mod(t,2.5)/0.3125)"
+    env = f"min(1,{BP}/0.35)*min(1,(2.5-{BP})/0.3)"
+
+    def pad(chords, g):
+        parts = []
+        for tone in range(3):
+            f = _pick(BI, [c[tone] for c in chords])
+            parts.append(f"{g}*(sin(2*PI*({f})*t)+0.4*sin(2*PI*2*({f})*t)+0.15*sin(2*PI*1.003*({f})*t))")
+        return "(" + "+".join(parts) + f")*{env}"
+
+    def arp(pats, g, dec=6):
+        f = _pick(BI, [_pick(EI, p) for p in pats])
+        return f"{g}*sin(2*PI*({f})*t)*exp(-{dec}*{E8})*(1-exp(-300*{E8}))"
+
+    kick = lambda g, d=10: f"{g}*sin(2*PI*(48+60*exp(-30*{BT}))*{BT})*exp(-{d}*{BT})"
+    hat = lambda g: f"{g}*(random(0)-0.5)*exp(-80*mod(t+0.15625,0.3125))"
+    if mood == "calm":
+        ch = [[261.63, 329.63, 392.0], [220.0, 261.63, 329.63], [220.0, 261.63, 349.23], [196.0, 246.94, 293.66]]
+        pats = [[261.63, 329.63, 392.0, 329.63, 523.25, 392.0, 329.63, 392.0],
+                [220.0, 261.63, 329.63, 261.63, 440.0, 329.63, 261.63, 329.63],
+                [220.0, 261.63, 349.23, 261.63, 440.0, 349.23, 261.63, 349.23],
+                [196.0, 246.94, 293.66, 246.94, 392.0, 293.66, 246.94, 293.66]]
+        return f"{pad(ch, 0.16)}+{arp(pats, 0.20)}"
+    if mood == "sad":
+        ch = [[110.0, 220.0, 261.63], [87.31, 174.61, 220.0], [98.0, 196.0, 261.63], [98.0, 196.0, 246.94]]
+        lead = _pick(BI, [329.63, 349.23, 392.0, 293.66])
+        slow = "mod(t,1.25)"
+        return (f"{pad(ch, 0.17)}+0.14*sin(2*PI*({lead})*t+2.5*sin(2*PI*5*t))*{env}"
+                f"+0.20*sin(2*PI*2*({_pick(BI, [220.0, 174.61, 196.0, 196.0])})*t)*exp(-3*{slow})*(1-exp(-200*{slow}))")
+    if mood == "tense":
+        beat2 = "mod(t,1.25)"
+        return ("0.30*sin(2*PI*55*t)+0.22*sin(2*PI*58.27*t)+0.16*sin(2*PI*77.78*t)"
+                f"+0.55*sin(2*PI*(42+40*exp(-25*{beat2}))*{beat2})*exp(-9*{beat2})"
+                f"+0.30*sin(2*PI*(42+40*exp(-25*mod(t+0.95,1.25)))*mod(t+0.95,1.25))*exp(-9*mod(t+0.95,1.25))"
+                "+0.05*sin(2*PI*1480*t+6*sin(2*PI*0.7*t))*(0.5+0.5*sin(2*PI*t/10))"
+                f"+0.14*(random(0)-0.5)*pow({BP}/2.5,3)")
+    if mood == "rise":
+        ch = [[130.81, 261.63, 329.63], [98.0, 196.0, 246.94], [110.0, 220.0, 261.63], [87.31, 174.61, 220.0]]
+        pats = [[261.63, 329.63, 392.0, 523.25, 659.25, 784.0, 1046.5, 784.0],
+                [196.0, 246.94, 293.66, 392.0, 493.88, 587.33, 784.0, 587.33],
+                [220.0, 261.63, 329.63, 440.0, 523.25, 659.25, 880.0, 659.25],
+                [174.61, 220.0, 261.63, 349.23, 440.0, 523.25, 698.46, 523.25]]
+        return (f"{pad(ch, 0.14)}+{arp(pats, 0.20, 5)}+{kick(0.35)}+{hat(0.05)}"
+                f"+0.05*sin(2*PI*(300*mod(t,40)+18.75*mod(t,40)*mod(t,40)))*pow(mod(t,40)/40,2)")
+    if mood == "epic":
+        roots = [[110.0, 164.81, 220.0], [87.31, 130.81, 174.61], [130.81, 196.0, 261.63], [98.0, 146.83, 196.0]]
+        parts = []
+        for tone in range(3):
+            f = _pick(BI, [r[tone] for r in roots])
+            parts.append("+".join(f"{0.11 / h:.3f}*sin(2*PI*{h}*({f})*t)" for h in range(1, 5)))
+        bass = _pick(BI, [55.0, 43.65, 65.41, 49.0])
+        lead = _pick(BI, [440.0, 349.23, 523.25, 392.0])
+        return ("(" + "+".join(parts) + f")*{env}+0.30*sin(2*PI*({bass})*t)*(0.55+0.45*exp(-8*{E8}))"
+                f"+{kick(0.60, 8)}+0.22*(random(0)-0.5)*exp(-22*mod(t-0.625,1.25))"
+                f"+0.10*sin(2*PI*({lead})*t)*{env}")
+    if mood == "action":
+        root = _pick(BI, [110.0, 110.0, 87.31, 98.0])
+        gate = "lt(mod(t,0.15625),0.105)"
+        stab = _pick(BI, [440.0, 440.0, 349.23, 392.0])
+        off = "mod(t-0.3125,0.625)"
+        return (f"0.30*({gate})*(sin(2*PI*({root})*t)+0.5*sin(2*PI*2*({root})*t)+0.25*sin(2*PI*3*({root})*t))"
+                f"+{kick(0.65, 9)}+0.24*(random(0)-0.5)*exp(-25*mod(t-0.625,1.25))+{hat(0.07)}"
+                f"+0.13*(sin(2*PI*({stab})*t)+sin(2*PI*1.189*({stab})*t)+sin(2*PI*1.498*({stab})*t))*exp(-18*{off})*gt(t,0.3125)")
+    raise ValueError(mood)
+
+
+def synth_mood(mood, out):
+    """Петля настроения 40 секунд (16 тактов в 96 уд/мин), одинаково громкая у всех настроений."""
+    out = pathlib.Path(out)
+    if out.exists() and out.stat().st_size > 100000:
+        return out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    wide = "stereowiden=delay=22:feedback=0.25:crossfeed=0.2,lowpass=f=9500,aecho=0.8:0.55:70|140:0.22|0.12"
+    _ff("-f", "lavfi", "-i", f"aevalsrc='{mood_expr(mood)}':s=22050:d={_MLOOP:.3f}", "-af",
+        f"aformat=sample_rates=44100:channel_layouts=stereo,{wide},loudnorm=I=-23:TP=-2:LRA=7", "-ar", "44100", str(out))
+    return out
+
+
+# ── настроение каждой сцены
+
+def _heur_moods(scenes):
+    n = len(scenes)
+    order = ["epic", "action", "tense", "sad", "rise", "calm"]
+    out = []
+    for i, sc in enumerate(scenes):
+        text = str(sc.get("narration", "")).lower()
+        sc_n = {m: len(re.findall(MOOD_KEYS[m], text)) for m in MOODS}
+        best = max(order, key=lambda m: (sc_n[m], -order.index(m)))
+        if sc_n[best] == 0:                          # ключевых слов нет: дуга истории по положению сцены
+            pos = i / max(1, n - 1)
+            best = "tense" if pos < 0.12 else "calm" if pos < 0.4 else "tense" if pos < 0.55 else "rise" if pos < 0.8 else "epic"
+        out.append(best)
+    return out
+
+
+def scene_moods(scenes):
+    """Настроение сцены: из ответа Gemini (поле mood), если оно из списка, иначе по словам и положению в истории."""
+    base = _heur_moods(scenes)
+    return [sc["mood"] if sc.get("mood") in MOODS else base[i] for i, sc in enumerate(scenes)]
+
+
+def _merge_sections(moods, words, min_words=13, max_sections=5):
+    runs = []
+    for i, m in enumerate(moods):
+        if runs and runs[-1]["mood"] == m:
+            runs[-1]["idx"].append(i)
+            runs[-1]["w"] += words[i]
+        else:
+            runs.append({"mood": m, "idx": [i], "w": words[i]})
+    while len(runs) > 1:
+        k = min(range(len(runs)), key=lambda j: runs[j]["w"])
+        if runs[k]["w"] >= min_words and len(runs) <= max_sections:
+            break
+        nb = k - 1 if k > 0 and (k == len(runs) - 1 or runs[k - 1]["w"] >= runs[k + 1]["w"]) else k + 1
+        a, b = sorted((k, nb))
+        runs[a] = {"mood": runs[nb]["mood"], "idx": runs[a]["idx"] + runs[b]["idx"], "w": runs[a]["w"] + runs[b]["w"]}
+        del runs[b]
+        j = 0
+        while j < len(runs) - 1:                      # соседние с одинаковым настроением склеиваем
+            if runs[j]["mood"] == runs[j + 1]["mood"]:
+                runs[j] = {"mood": runs[j]["mood"], "idx": runs[j]["idx"] + runs[j + 1]["idx"],
+                           "w": runs[j]["w"] + runs[j + 1]["w"]}
+                del runs[j + 1]
+            else:
+                j += 1
+    return runs
+
+
+def transition_style(prev, nxt):
+    """Как музыка меняется на границе: (название, длина перекрытия в секундах)."""
+    if nxt in ("epic", "action") and prev not in ("epic", "action"):
+        return "hit", 0.08               # удар: нарастание перед границей и резкий вход новой музыки
+    if nxt == "tense":
+        return "creep", 2.2              # тревога подкрадывается долгим перекрытием
+    if nxt == "sad":
+        return "slow", 2.0
+    if prev == "tense":
+        return "release", 1.4
+    return "cross", 1.6
+
+
+_bpm_cache = {}
+
+
+def _library_track(mood, seed, work):
+    """Трек настроения: ваш файл из music/<настроение>/ или синтез. -> {"path", "bpm", "offset", "own"}"""
+    folder = pathlib.Path(C["ROOT"]) / "music" / mood
+    files = sorted(p for p in folder.glob("*") if p.suffix.lower() in (".mp3", ".wav", ".ogg", ".m4a")) if folder.exists() else []
+    if files:
+        p = random.Random(f"{seed}{mood}").choice(files)
+        if str(p) not in _bpm_cache:
+            _bpm_cache[str(p)] = detect_bpm(p)
+        r = _bpm_cache[str(p)]
+        return {"path": p, "bpm": r[0] if r else None, "offset": r[1] if r else 0.0, "own": True}
+    cache = pathlib.Path(C.get("MUSIC_CACHE") or work)
+    return {"path": synth_mood(mood, cache / f"mood_{mood}_v1.wav"), "bpm": _MBPM, "offset": 0.0, "own": False}
+
+
+def plan_music(scenes, seed, work):
+    """План музыки: настроение сцен -> секции -> трек и переход для каждой. Секции без t0, его проставит цикл сцен."""
+    moods = scene_moods(scenes)
+    words = [max(1, len(str(sc.get("narration", "")).split())) for sc in scenes]
+    runs = _merge_sections(moods, words)
+    sections, of_scene = [], [0] * len(scenes)
+    for k, run_ in enumerate(runs):
+        track = _library_track(run_["mood"], seed, work)
+        style, x = transition_style(runs[k - 1]["mood"], run_["mood"]) if k else ("start", 0.0)
+        sections.append({"mood": run_["mood"], "scenes": run_["idx"], "track": track, "style": style, "x": x, "t0": None})
+        for i in run_["idx"]:
+            of_scene[i] = k
+    return {"sections": sections, "of_scene": of_scene, "moods": moods}
+
+
+def build_music_bed(plan, total, work, out):
+    """Склеивает музыку по секциям: перекрытие на границах по стилю перехода. Секция начинается на своей первой доле."""
+    secs = plan["sections"]
+    segs = []
+    for i, sec in enumerate(secs):
+        t0 = sec["t0"] if sec["t0"] is not None else 0.0
+        t_end = (secs[i + 1]["t0"] + secs[i + 1]["x"]) if i + 1 < len(secs) else total + 2.5
+        seg = pathlib.Path(work) / f"mus_seg{i}.wav"
+        tr = sec["track"]
+        _ff("-stream_loop", "-1", "-ss", f"{tr['offset']:.3f}", "-i", str(tr["path"]), "-t", f"{t_end - t0:.3f}",
+            "-af", "loudnorm=I=-23:TP=-2:LRA=7", "-ar", "44100", "-ac", "2", str(seg))
+        segs.append(seg)
+    if len(segs) == 1:
+        pathlib.Path(out).write_bytes(segs[0].read_bytes())
+        return out
+    cmd, fc, prev = [], [], "0:a"
+    for s_ in segs:
+        cmd += ["-i", str(s_)]
+    for i in range(1, len(segs)):
+        curve = "qsin" if secs[i]["style"] in ("creep", "slow") else "tri"
+        fc.append(f"[{prev}][{i}:a]acrossfade=d={secs[i]['x']:.3f}:c1={curve}:c2={curve}[m{i}]")
+        prev = f"m{i}"
+    _ff(*cmd, "-filter_complex", ";".join(fc), "-map", f"[{prev}]", "-ar", "44100", "-ac", "2", str(out))
+    return out
+
+
+def music_cuts(plan):
+    """[(время, стиль)] границ секций: по ним добавляются нарастание и удар."""
+    return [(s["t0"], s["style"]) for s in plan["sections"][1:] if s["t0"] is not None]
