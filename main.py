@@ -139,14 +139,14 @@ SERIES_CARD = [x.strip() for x in (ENV("SERIES_CARD") or "ИСТОРИЯ|ЗА О
 PIXEL_ART = (ENV("PIXEL_ART") or "1") != "0"
 ART_STYLE = (ENV("ART_STYLE") or "").strip()      # свой стиль целиком, например "watercolor illustration"
 STYLE_STORY = ART_STYLE or (
-    "pixel art illustration, 16-bit retro game style, crisp square pixels, limited color palette, flat colors "
-    "with simple dithering, chunky pixel sprites, clean pixel outlines, no film grain, no noise, "
+    "pixel art illustration, 16-bit retro game style, crisp square pixels, bright vivid saturated colors, "
+    "sunny colorful lighting, chunky pixel sprites, clean pixel outlines, no grayscale, no film grain, no noise, "
     "vertical 9:16 composition, no text" if PIXEL_ART else
     "detailed digital comic illustration, semi-realistic, cinematic lighting, rich colors, "
     "vertical 9:16 composition, no text")
 OVERLAP = 0.25      # длина перехода между кадрами, сек
 RED = "0xE0101A"
-STYLE = ART_STYLE or ("pixel art, 16-bit retro game style, crisp square pixels, limited color palette, battle royale setting"
+STYLE = ART_STYLE or ("pixel art, 16-bit retro game style, crisp square pixels, bright vivid saturated colors, battle royale setting"
                      if PIXEL_ART else "stylized 3D cartoon game art, vibrant colors, clean shapes, battle royale setting")
 
 # SFX генерируются прямо в ffmpeg: (источник, фильтры, задержка в мс)
@@ -1230,7 +1230,82 @@ def plan_cuts(total, weights, cands):
     return sorted(cuts)
 
 
+_voice_words = {}      # файл сцены -> [(начало, конец)] каждого слова сценария относительно начала файла
+
+
+def script_tokens(text):
+    return [w for w in (re.sub(r"[.,;:?!«»\"“”]", "", x) for x in text.split()) if w]
+
+
+def _quietest_point(samples, sr, a, b):
+    """Самое тихое место между концом одной фразы и началом следующей."""
+    import numpy as np
+    if b - a < 0.04:
+        return (a + b) / 2
+    seg = samples[int(a * sr):int(b * sr)]
+    win = max(1, int(0.01 * sr))
+    n = len(seg) // win
+    if n < 2:
+        return (a + b) / 2
+    rms = np.sqrt((seg[:n * win].reshape(n, win) ** 2).mean(axis=1))
+    k = int(np.argmin(rms))
+    return a + (k + 0.5) * win / sr
+
+
+def split_voice_aligned(wav, phrases, tag):
+    """Режет общую озвучку по границам слов: Whisper даёт время каждого слова, слова сценария сопоставляются с ними,
+    резка идёт в самом тихом месте между фразами. Слов не обрезает и время слов для субтитров получается точным.
+    None, если Whisper недоступен или сопоставление не вышло (тогда работает старый способ по паузам)."""
+    import numpy as np
+    rec = whisper_words(wav)
+    if not rec:
+        return None
+    toks = [script_tokens(p) for p in phrases]
+    times = align_words([w for t in toks for w in t], rec)
+    if not times or any(not t for t in toks):
+        return None
+    bounds, pos = [], 0
+    for t in toks:
+        seg = times[pos:pos + len(t)]
+        pos += len(t)
+        bounds.append((seg[0][0], seg[-1][1], seg))
+    if any(b[1] <= b[0] for b in bounds):
+        return None
+    raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(wav), "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                         capture_output=True, check=True).stdout
+    samples, sr = np.frombuffer(raw, dtype=np.float32), 16000
+    total = duration(wav)
+    cuts = [0.0]
+    for k in range(len(bounds) - 1):
+        a, b = bounds[k][1], bounds[k + 1][0]
+        if b < a:                                   # слова внахлёст: режем посередине
+            a, b = b, a
+        cuts.append(_quietest_point(samples, sr, a, b))
+    cuts.append(total)
+    files = []
+    for i, (w0, w1, seg) in enumerate(bounds):
+        start = max(cuts[i], w0 - 0.08)             # чуть тишины перед словом и после, ничего не обрезаем
+        end = min(cuts[i + 1], w1 + 0.16)
+        if end - start < 0.3:
+            return None
+        out = WORK / f"{tag}_{i:02d}.wav"
+        # -ss до -i: время куска начинается с нуля, иначе затухание afade считается от начала всей озвучки
+        run(["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-i", str(wav), "-ac", "1", "-af",
+             f"afade=t=in:d=0.012,afade=t=out:st={max(0.0, end - start - 0.03):.3f}:d=0.03", str(out)])
+        _voice_words[str(out)] = [(max(0.0, a - start), max(0.0, b - start)) for a, b in seg]
+        files.append(out)
+    log(f"озвучка разрезана по словам: {len(files)} фраз, без обрезанных слов")
+    return files
+
+
 def split_voice(wav, phrases, tag):
+    try:
+        files = split_voice_aligned(wav, phrases, tag)
+    except Exception as e:  # noqa
+        log("резка озвучки по словам не вышла, режу по паузам:", str(e)[:120])
+        files = None
+    if files:
+        return files
     total = duration(wav)
     cuts = [0.0] + plan_cuts(total, [len(p) + 3 for p in phrases], find_silences(wav)) + [total]
     files = []
@@ -1501,6 +1576,12 @@ def validate_story_script(s):
     if s["title_line"] and not s["scenes"][idx].get("card"):
         lines = [s["title_line"]] + SERIES_CARD
         s["scenes"][idx]["card"] = {"lines": lines[:3], "red": len(lines[:3]) - 1}
+    # чёрно-белых кадров максимум один, и то не всегда: Gemini помечает «прошлым» почти всю историю
+    fl = [i for i, sc in enumerate(s["scenes"]) if sc.get("flashback")]
+    for i in fl[1:]:
+        s["scenes"][i]["flashback"] = False
+    if fl and random.random() < 0.5:
+        s["scenes"][fl[0]]["flashback"] = False
     diversify_prompts(s["scenes"])
     return s
 
@@ -1916,8 +1997,12 @@ def words_timeline(text, d, accent, voice=None):
 
     real = None
     if voice is not None:
-        rec = whisper_words(voice)
-        real = align_words(words, rec) if rec else None
+        pre = _voice_words.get(str(voice))
+        if pre and len(pre) == len(words):         # времена уже посчитаны при резке озвучки
+            real = pre
+        else:
+            rec = whisper_words(voice)
+            real = align_words(words, rec) if rec else None
     if real:
         starts = [max(0.02, st - 0.04) for st, _ in real]
         for k in range(1, len(starts)):                     # слова идут строго друг за другом
