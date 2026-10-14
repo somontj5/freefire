@@ -1,567 +1,420 @@
 #!/usr/bin/env python3
-"""Клиент сайта genspark.ai без API: Playwright открывает чат, отправляет промпт, забирает ответ.
-
-Разметка сверена с сохранённой страницей genspark.ai:
-  поле ввода  - textarea[name="query"] с хуком j-search-input (плейсхолдер «Спросите что угодно…»);
-  вход        - не отдельная страница /login, а диалог (LoginDialog) и кнопка «Войти»/«Sign in»;
-  ответы      - рендерятся в блоки с markdown-классами уже на странице чата.
-
-Аккаунты БЕЗ ОГРАНИЧЕНИЯ по количеству, два способа задать:
-  1) отдельные секреты GENSPARK_STORAGE_1, GENSPARK_STORAGE_2, ... - сканируются подряд
-     без жёсткого предела (останов через 5 пустых номеров подряд, так что нумеровать можно с любыми пропусками);
-  2) один общий секрет GENSPARK_STORAGES - JSON-массив из base64-строк (или готовых storageState),
-     туда влезает любое число аккаунтов.
-Переменная GENSPARK_ACCOUNTS (по умолчанию 1) задаёт, сколько найденных аккаунтов в ротации
-("all" или 0 = все найденные); GENSPARK_ROUNDS - сколько кругов делать по всем аккаунтам,
-прежде чем сдаться (по умолчанию 2). Сбойный аккаунт пропускается. Если все не ответили -
-исключение, и main.py падает на запасной путь (Gemini API), как раньше.
-"""
+"""Server-side browser with HUMAN approval, no stealth/captcha-solving/paid auto retries."""
+import atexit
 import base64
+import hashlib
 import json
+import math
 import os
 import re
+import subprocess
 import time
-import traceback
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+import runtime_settings as settings
+from remote_control import atomic,read
 
-# Селекторы можно переопределить переменными, если сайт поменяет разметку
-INPUT_SEL = os.environ.get("GENSPARK_INPUT_SELECTOR") or ""
-ANSWER_SEL = os.environ.get("GENSPARK_ANSWER_SELECTOR") or ""
+settings.apply()
+PRIVATE=Path(__file__).resolve().parent/'private-runtime'
+SESSIONS=PRIVATE/'sessions'
+_state={'next':0,'blocked':set()}
+_pool={};_pw=None
+INPUT_SELECTORS=["textarea[name='query']",'.j-search-input','textarea','[contenteditable=true]']
+ANSWER_SELECTORS=['[data-message-role=assistant]','[data-role=assistant]',"[data-testid='chat-answer']",'.markdown-body','.markdown-prose','.prose']
 
-# По разметке genspark.ai: сначала точные (name="query", хук j-search-input), потом общие
-INPUT_SELECTORS = ([INPUT_SEL] if INPUT_SEL else []) + [
-    "textarea[name='query']", ".j-search-input", "textarea.search-input",
-    "textarea[placeholder*='спрос' i]", "textarea[placeholder*='ask' i]",
-    "textarea[placeholder*='chat' i]", "textarea#chat-input", "textarea",
-    "div[contenteditable='true']", "[contenteditable='true']",
-]
-# Блоки с ответом ассистента (страница чата рендерит markdown-блоки)
-ANSWER_SELECTORS = ([ANSWER_SEL] if ANSWER_SEL else []) + [
-    "[data-testid='chat-answer']", "[data-testid*='message' i]", "[class*='markdown']",
-    ".chat-answer", ".markdown-body", ".prose", ".message-content", ".chat-message-content",
-]
-# Кнопка отправки (появляется после ввода текста)
-SEND_SELECTORS = [
-    "button[type='submit']", "[aria-label*='отправ' i]", "[aria-label*='send' i]",
-    "[class*='send' i][role='button']", ".j-send-btn",
-]
-# Признаки, что сессия не принята: диалог входа или кнопка «Войти»/«Sign in»
-LOGIN_SELECTORS = [
-    "[class*='LoginDialog' i]", "[class*='login-dialog' i]", "[class*='AuthToolsPopup' i]",
-    "[data-testid*='login' i]",
-]
-
-_state = {"next": 0, "dead": set()}
+class ManualRequired(RuntimeError):pass
+class AccountUnavailable(RuntimeError):pass
+class BrowserLayoutError(RuntimeError):pass
+class BudgetMismatch(RuntimeError):pass
 
 
-def base_url():
-    return os.environ.get("GENSPARK_URL") or "https://www.genspark.ai"
-
-
-def timeout_s():
-    return int(os.environ.get("GENSPARK_TIMEOUT") or 900)          # секунд на один ответ
-
-
-def retries_n():
-    return int(os.environ.get("GENSPARK_RETRIES") or 2)            # попыток на аккаунт за раунд
-
-
-def rounds_n():
-    return int(os.environ.get("GENSPARK_ROUNDS") or 2)             # кругов ротации по аккаунтам
-
-
-def page_timeout_ms():
-    return int(os.environ.get("GENSPARK_PAGE_TIMEOUT") or 60_000)  # мс на загрузку страниц
-
-
-def video_timeout_s():
-    return int(os.environ.get("GENSPARK_VIDEO_TIMEOUT") or 1800)   # секунд на генерацию видео
-
-
-def video_url():
-    return os.environ.get("GENSPARK_VIDEO_URL") or base_url()      # страница видео-агента сайта
-
-
-def anim_model():
-    """Какая модель оживления запрашивается на сайте. По умолчанию Grok lite - самая дешёвая
-    (сверено с каталогом Grok Imagine Video: lite поддерживает 480p и 4 с)."""
-    return (os.environ.get("GENSPARK_ANIM_MODEL") or "Grok lite").strip() or "Grok lite"
-
-
+def log(*args):print(*args,flush=True)
+def base_url():return os.environ.get('GENSPARK_URL') or settings.DEFAULTS['GENSPARK_URL']
+def video_url():return os.environ.get('GENSPARK_VIDEO_URL') or base_url()
+def number(k):return int(os.environ.get(k) or settings.DEFAULTS[k])
+def timeout_s():return number('GENSPARK_TIMEOUT')
+def retries_n():return number('GENSPARK_RETRIES')
+def rounds_n():return number('GENSPARK_ROUNDS')
+def page_timeout_ms():return number('GENSPARK_PAGE_TIMEOUT')
+def video_timeout_s():return number('GENSPARK_VIDEO_TIMEOUT')
+def anim_model():return os.environ.get('GENSPARK_ANIM_MODEL') or 'Grok lite'
 def anim_duration_s():
-    """Длительность оживления в секундах. По умолчанию 3 - самая дешёвая
-    (Grok Imagine Video поддерживает 1-15 с; короткий ролик зациклится под длину фразы)."""
+    try:return max(1,min(15,int(os.environ.get('GENSPARK_ANIM_DURATION') or '3')))
+    except ValueError:return 3
+
+def anim_quality():return os.environ.get('GENSPARK_ANIM_QUALITY') or '480p'
+def remote():return os.environ.get('GENSPARK_REMOTE')=='1' and bool(os.environ.get('GENSPARK_REMOTE_CONTROL'))
+
+
+def _parse_storage(raw,label='session'):
+    # Never print raw values, cookie names or parsing exception details.
     try:
-        v = int(os.environ.get("GENSPARK_ANIM_DURATION") or "3")
-    except ValueError:  # noqa
-        v = 4
-    return max(3, min(10, v))
-
-
-def anim_quality():
-    """Качество оживления: 480p (максимальная экономия, по умолчанию) или 720p."""
-    q = (os.environ.get("GENSPARK_ANIM_QUALITY") or "480p").strip().lower()
-    return q if q in ("480p", "720p") else "480p"
-
-
-def _parse_storage(raw, label):
-    """base64 от storageState (или чистый JSON storageState) -> dict. None - не получилось."""
-    try:
-        return json.loads(base64.b64decode(raw))
-    except Exception:  # noqa
-        try:
-            return json.loads(raw)
-        except Exception:  # noqa
-            log(f"{label}: не удалось прочитать (это должен быть base64 от storageState)")
-            return None
-
-
-def accounts_count():
-    """Сколько найденных аккаунтов использовать. По умолчанию 1.
-    'all' или 0 = все найденные без ограничения."""
-    v = (os.environ.get("GENSPARK_ACCOUNTS") or "1").strip().lower()
-    if v in ("all", "0", "-"):
-        return len(accounts_all())
-    try:
-        return max(1, int(v or 1))
-    except ValueError:  # noqa
-        return 1
+        if isinstance(raw,dict):d=raw
+        else:
+            try:d=json.loads(raw)
+            except ValueError:d=json.loads(base64.b64decode(raw))
+        if not isinstance(d,dict) or not isinstance(d.get('cookies',[]),list):raise ValueError()
+        return d
+    except Exception:
+        raise ValueError(f'{label}: неверный формат секрета. Используй JSON storageState или base64.') from None
 
 
 def accounts_all():
-    """ВСЕ найденные аккаунты (имя, storageState) - без ограничения по количеству.
-    Источники: общий секрет GENSPARK_STORAGES (массив) + отдельные GENSPARK_STORAGE_1..N.
-    Отдельные сканируются подряд; останов, если 5 номеров подряд пусты."""
-    out = []
-    blob = (os.environ.get("GENSPARK_STORAGES") or "").strip()
+    out=[];blob=os.environ.get('GENSPARK_STORAGES','').strip()
     if blob:
-        try:
-            arr = json.loads(blob)
-            if isinstance(arr, str):
-                arr = [arr]
-            for k, item in enumerate(arr if isinstance(arr, list) else [], 1):
-                s = item if isinstance(item, str) else json.dumps(item)
-                data = item if isinstance(item, dict) else _parse_storage(s, f"GENSPARK_STORAGES[{k}]")
-                if data:
-                    out.append((f"аккаунт {k} (общий)", data))
-        except Exception as e:  # noqa
-            log(f"GENSPARK_STORAGES: не удалось разобрать ({str(e)[:80]})")
-    empty, i = 0, 0
-    while empty < 5 and i < 500:                      # предохранитель от бесконечного цикла
-        i += 1
-        raw = (os.environ.get(f"GENSPARK_STORAGE_{i}") or "").strip()
-        if not raw:
-            empty += 1
-            continue
-        empty = 0
-        data = _parse_storage(raw, f"GENSPARK_STORAGE_{i}")
-        if data:
-            out.append((f"аккаунт {i}", data))
-    return out
+        try:arr=json.loads(blob)
+        except ValueError:raise ValueError('GENSPARK_STORAGES: нужен JSON-массив') from None
+        if not isinstance(arr,list):raise ValueError('GENSPARK_STORAGES: нужен JSON-массив')
+        for i,item in enumerate(arr,1):out.append((f'account-{i}',_parse_storage(item,f'account-{i}')))
+    for k in sorted((k for k in os.environ if re.fullmatch(r'GENSPARK_STORAGE_\d+',k)),key=lambda k:int(k.rsplit('_',1)[1])):
+        if os.environ[k].strip():out.append((f'account-{k.rsplit("_",1)[1]}',_parse_storage(os.environ[k],k)))
+    # Include encrypted restored sessions and empty accounts for manual server-side login.
+    if SESSIONS.exists():
+        for p in sorted(SESSIONS.glob('account-*.json')):
+            if p.stem not in {name for name,_ in out}:out.append((p.stem,read(p)))
+    if not out and remote():
+        n=os.environ.get('GENSPARK_ACCOUNTS') or '1'
+        if n=='all':n='1'
+        out=[(f'account-{i}',{'cookies':[],'origins':[]}) for i in range(1,int(n)+1)]
+    unique={}
+    for name,st in out:unique.setdefault(name,st)
+    # Adding an account must work when previous accounts already have saved sessions.
+    if remote():
+        requested=os.environ.get('GENSPARK_ACCOUNTS') or '1'
+        if requested not in ('all','0'):
+            idx=1
+            while len(unique)<int(requested):
+                name=f'account-{idx}'
+                unique.setdefault(name,{'cookies':[],'origins':[]})
+                idx+=1
+    return list(unique.items())
 
 
-def accounts():
-    """Аккаунты в ротации: первые N из найденных (N = GENSPARK_ACCOUNTS, по умолчанию 1)."""
-    return accounts_all()[:accounts_count()]
-
-
-def log(*a):
-    print(*a, flush=True)
-
-
-def _first(page, selectors, timeout_ms=8000):
-    end = time.time() + timeout_ms / 1000
-    while time.time() < end:
-        for sel in selectors:
-            try:
-                el = page.locator(sel).first
-                if el.count() and el.is_visible():
-                    return el
-            except Exception:  # noqa
-                pass
-        time.sleep(0.5)
-    return None
+def accounts_count():
+    v=os.environ.get('GENSPARK_ACCOUNTS') or '1'
+    return len(accounts_all()) if v in ('all','0') else max(1,int(v))
+def accounts():return accounts_all()[:accounts_count()]
 
 
 def _sanitize_cookie(c):
-    """Кука, которую Chromium точно примет, или None (без имени/домена - брак).
-    Cookie Editor часто отдаёт поля, из-за которых Storage.setCookies отвергает ВЕСЬ набор:
-    SameSite=None без Secure, expires=0, строгие префиксы __Host-/__Secure-."""
-    name = str(c.get("name") or "").strip()
-    value = str(c.get("value") or "")
-    domain = str(c.get("domain") or "").strip()
-    if not name or not value or not domain:
-        return None
-    path = str(c.get("path") or "/").strip() or "/"
-    ss = str(c.get("sameSite") or "").strip()
-    ss = ss if ss in ("None", "Lax", "Strict") else "Lax"
-    try:
-        expires = float(c.get("expires", -1))
-    except Exception:  # noqa
-        expires = -1.0
-    if expires != -1 and expires <= 0:
-        expires = -1.0                      # expires=0 Chromium считает битым
-    secure = bool(c.get("secure", False))
-    if ss == "None":
-        secure = True                       # SameSite=None требует Secure
-    if name.startswith("__Secure-"):
-        secure = True
-    if name.startswith("__Host-"):
-        secure, path, domain = True, "/", domain.lstrip(".")   # host-only кука
-    return {"name": name, "value": value, "domain": domain, "path": path,
-            "expires": expires, "httpOnly": bool(c.get("httpOnly", False)),
-            "secure": secure, "sameSite": ss}
+    if not isinstance(c,dict):return None
+    name=c.get('name','');domain=c.get('domain','')
+    if not isinstance(name,str) or any(ord(ch)<33 or ch in ';,' for ch in name) or not name:
+        raise ValueError('Повреждённый экспорт: имя cookie содержит табы/пробелы. Обнови секрет через JSON-export.')
+    if not isinstance(domain,str):return None
+    host=domain.lstrip('.')
+    if host!='genspark.ai' and not host.endswith('.genspark.ai'):return None
+    value=c.get('value','')
+    if not isinstance(value,str) or any(ord(ch)<32 for ch in value):raise ValueError('Недопустимые поля cookie; нужен свежий JSON-export.')
+    path=c.get('path') or '/'
+    if not isinstance(path,str) or not path.startswith('/'):raise ValueError('Недопустимый путь cookie')
+    ss=c.get('sameSite','Lax'); ss={'no_restriction':'None','unspecified':'Lax'}.get(ss,ss)
+    if ss not in ('None','Lax','Strict'):ss='Lax'
+    exp=float(c.get('expires',c.get('expirationDate',-1)) or -1)
+    if not math.isfinite(exp):raise ValueError('Недопустимый срок cookie')
+    if exp not in (-1,0) and exp<time.time():return None
+    if exp==0:exp=-1
+    secure=bool(c.get('secure',True))
+    if ss=='None' or name.startswith('__Secure-'):secure=True
+    if name.startswith('__Host-'):secure=True;path='/';domain=domain.lstrip('.')
+    return dict(name=name,value=value,domain=domain,path=path,expires=exp,secure=secure,
+                httpOnly=bool(c.get('httpOnly',False)),sameSite=ss)
 
 
-def _new_ctx(browser, storage, tag):
-    """Контекст браузера с куками аккаунта. Сначала подаём чищеный набор целиком;
-    если Chromium и его не принял - добавляем куки по одной, пропуская битые
-    (localStorage сохраняется в обоих случаях)."""
-    origins = storage.get("origins") or []
-    clean = [s for s in (_sanitize_cookie(c) for c in (storage.get("cookies") or [])) if s]
-    try:
-        return browser.new_context(storage_state={"cookies": clean, "origins": origins},
-                                   viewport={"width": 1366, "height": 900}, locale="en-US")
-    except Exception as e:  # noqa
-        if "cookie" not in str(e).lower():
-            raise
-        log(f"{tag}: набор кук не принят целиком ({str(e)[:110]}), добавляю по одной, пропуская битые")
-        ctx = browser.new_context(storage_state={"cookies": [], "origins": origins},
-                                  viewport={"width": 1366, "height": 900}, locale="en-US")
-        dropped = []
-        for c in clean:
-            try:
-                ctx.add_cookies([c])
-            except Exception:  # noqa
-                dropped.append(c["name"])
-        if dropped:
-            log(f"{tag}: Chromium не принял куки (пропущены): {', '.join(dropped[:8])}"
-                + ("..." if len(dropped) > 8 else ""))
-        return ctx
+def _clean(storage):
+    cookies=[v for v in (_sanitize_cookie(c) for c in storage.get('cookies',[])) if v]
+    origins=[]
+    for o in storage.get('origins',[]):
+        host=urlparse(o.get('origin','')).hostname or ''
+        if host=='genspark.ai' or host.endswith('.genspark.ai'):origins.append(o)
+    return {'cookies':cookies,'origins':origins}
+
+
+def _context(name,storage):
+    global _pw
+    if name in _pool:return _pool[name][1]
+    # Limit RAM on small GitHub runners: keep only the active account browser.
+    for other,(browser,context) in list(_pool.items()):
+        _persist(other,context);browser.close();del _pool[other]
+    from playwright.sync_api import sync_playwright
+    if _pw is None:_pw=sync_playwright().start()
+    path=SESSIONS/f'{name}.json'
+    actual=read(path) if path.exists() else storage
+    try:clean=_clean(actual)
+    except ValueError:
+        if not remote():raise
+        log(f'{name}: старый экспорт повреждён; открываю пустую сессию для ручного входа, без ремонта токенов.')
+        clean={'cookies':[],'origins':[]}
+    b=_pw.chromium.launch(headless=(os.environ.get('GENSPARK_HEADLESS','0')=='1'),
+                          args=['--window-size=1280,800'])
+    try:ctx=b.new_context(storage_state=clean,viewport={'width':1240,'height':700},locale='ru-RU',accept_downloads=True)
+    except Exception:
+        b.close();raise ValueError('Chromium отклонил cookie. Не пропускаю неизвестную cookie авторизации; обнови JSON-export.') from None
+    _pool[name]=(b,ctx)
+    return ctx
+
+
+def _persist(name,ctx):
+    # encrypted backup is built at job end; plaintext stays in ignored, private directory only
+    st=ctx.storage_state()
+    atomic(SESSIONS/f'{name}.json',_clean(st))
+
+
+def close():
+    global _pw
+    for name,(b,ctx) in list(_pool.items()):
+        try:_persist(name,ctx)
+        except Exception:pass
+        try:b.close()
+        except Exception:pass
+    _pool.clear()
+    if _pw:
+        try:_pw.stop()
+        except Exception:pass
+        _pw=None
+atexit.register(close)
+
+
+def _first(page,selectors,timeout_ms=8000):
+    end=time.monotonic()+timeout_ms/1000
+    while time.monotonic()<end:
+        for sel in selectors:
+            for el in page.locator(sel).all():
+                if el.is_visible():return el
+        page.wait_for_timeout(250)
+    return None
 
 
 def _login_visible(page):
-    """Сессия не принята: редирект на вход, диалог входа или кнопка «Войти»/«Sign in» на странице."""
-    try:
-        u = page.url.lower()
-        if any(x in u for x in ("/login", "signin", "sign-in", "accounts.google", "/auth")):
-            return True
-    except Exception:  # noqa
-        pass
-    for sel in LOGIN_SELECTORS:
-        try:
-            el = page.locator(sel).first
-            if el.count() and el.is_visible():
-                return True
-        except Exception:  # noqa
-            pass
-    try:
-        texts = page.evaluate(
-            "() => Array.from(document.querySelectorAll('button,a,[role=button]'))"
-            ".map(e => (e.innerText || '').trim()).filter(t => t && t.length < 30)")
-        for t in texts:
-            tl = t.lower()
-            if tl in ("войти", "вход", "log in", "login", "sign in") or tl.startswith("sign in "):
-                return True
-    except Exception:  # noqa
-        pass
+    u=page.url.lower()
+    if any(x in u for x in ('/login','/signin','accounts.google.com')):return True
+    for label in ('Войти','Sign in','Log in'):
+        if page.get_by_text(label,exact=True).first.is_visible():return True
     return False
+
+
+def challenge(page):
+    text=page.locator('body').inner_text(timeout=3000).lower()
+    return any(s in text for s in ('performing security verification','verify you are human','проверка безопасности','checking your browser'))
+
+
+def quota(page):
+    text=page.locator('body').inner_text(timeout=3000).lower()
+    return any(s in text for s in ('insufficient credits','not enough credits','daily limit reached','недостаточно кредитов','дневной лимит исчерпан'))
+
+
+def notify(message):
+    if os.environ.get('TG_TOKEN') and os.environ.get('TG_CHAT_ID'):
+        import requests
+        try:
+            requests.post('https://api.telegram.org/bot'+os.environ['TG_TOKEN']+'/sendMessage',
+                          json={'chat_id':os.environ['TG_CHAT_ID'],'text':message},timeout=15)
+        except Exception:log('Не удалось отправить уведомление; ссылки в Summary Actions.')
+
+
+def human(message,on_tick=None):
+    if not remote():raise ManualRequired('Нужно ручное подтверждение; запусти workflow с Tailscale.')
+    rid=uuid.uuid4().hex
+    atomic(PRIVATE/'request.json',{'id':rid,'message':message})
+    control=os.environ['GENSPARK_REMOTE_CONTROL']; screen=os.environ.get('GENSPARK_REMOTE_SCREEN','')
+    notify(f'🖥 {message}\nЭкран: {screen}\nПодтвердить / остановить: {control}\nОжидание: {number("GENSPARK_MANUAL_WAIT")} с. Телефон не выполняет вычисления.')
+    log('Ожидаю ручное действие. Открой ссылки в Summary Actions / Telegram.')
+    end=time.monotonic()+number('GENSPARK_MANUAL_WAIT')
+    while time.monotonic()<end:
+        if on_tick:on_tick()
+        d=read(PRIVATE/'approval.json')
+        if d.get('id')==rid:
+            atomic(PRIVATE/'request.json',{'message':'Действие принято'})
+            if d.get('action')=='pause':raise ManualRequired('Ты остановил задачу; прогресс сохранён.')
+            return
+        time.sleep(.5)
+    raise ManualRequired('Время ручного подтверждения истекло; прогресс сохранён.')
+
+
+def _ready(name,ctx,url):
+    pg=ctx.new_page();pg.set_default_timeout(page_timeout_ms())
+    pg.goto(url,wait_until='domcontentloaded');pg.wait_for_timeout(1500)
+    if challenge(pg) or _login_visible(pg):
+        pg.bring_to_front()
+        human(f'{name}: пройди проверку Cloudflare или войди в Genspark вручную. Затем нажми «Выполнено».')
+        pg.wait_for_timeout(1000)
+        if challenge(pg) or _login_visible(pg):raise ManualRequired('Проверка/вход ещё не завершены. Обход защиты не используется.')
+    _persist(name,ctx)
+    return pg
 
 
 def _answer_text(page):
-    """Текст последнего ответа ассистента. Пустая строка, если ответа ещё нет."""
-    best = ""
-    for sel in ANSWER_SELECTORS:
+    override=os.environ.get('GENSPARK_ANSWER_SELECTOR')
+    selectors=[override] if override else ANSWER_SELECTORS
+    for sel in selectors:
+        els=page.locator(sel).all()
+        for e in reversed(els):
+            if e.is_visible():
+                t=e.inner_text().strip()
+                if t:return t
+    return ''
+
+
+def _text_task_path(prompt):
+    namespace=os.environ.get('GENSPARK_JOB_ID') or os.environ.get('GITHUB_RUN_ID') or 'local'
+    digest=hashlib.sha256((namespace+'\n'+prompt).encode()).hexdigest()
+    return SESSIONS/f'text-{digest}.json'
+
+
+def _chat_one(name,storage,prompt,shots_dir=None):
+    taskpath=_text_task_path(prompt);pending=read(taskpath)
+    if pending.get('status')=='complete':return pending['reply']
+    if pending.get('account') not in (None,name):raise ManualRequired('Текстовый запрос уже отправлен другим аккаунтом; не создаю дубль')
+    ctx=_context(name,storage); pg=_ready(name,ctx,pending.get('url') or base_url())
+    if pending:
+        before=''
+        human(f'{name}: продолжение уже отправленного текстового запроса. Дождись ответа в серверном браузере, затем «Выполнено». '
+              'Не отправляй запрос снова, если диалог уже существует.')
+    else:
+        inp=_first(pg,[os.environ['GENSPARK_INPUT_SELECTOR']] if os.environ.get('GENSPARK_INPUT_SELECTOR') else INPUT_SELECTORS)
+        if inp is None:raise BrowserLayoutError('Не найдено поле чата после входа. Нужна проверка UI, не повтор генерации.')
+        before=_answer_text(pg);inp.fill(prompt)
+        atomic(taskpath,{'account':name,'url':pg.url,'status':'submitted'})
+        # Send exactly once. No duplicate Enter, no silent 8000-character truncation.
+        inp.press('Enter')
+    end=time.monotonic()+timeout_s();last='';stable=0
+    while time.monotonic()<end:
+        pg.wait_for_timeout(1000)
+        page=ctx.pages[-1]
+        atomic(taskpath,{'account':name,'url':page.url,'status':'submitted'})
+        if quota(page):
+            taskpath.unlink(missing_ok=True)
+            raise AccountUnavailable('На этом аккаунте недостаточно кредитов')
+        if challenge(page):raise ManualRequired('Проверка появилась во время ответа; приостановлено')
+        cur=_answer_text(page)
+        busy=page.locator('[aria-busy=true]').count()>0 or page.get_by_role('button',name=re.compile('Stop|Остановить')).count()>0
+        if cur and cur!=before:
+            stable=stable+1 if cur==last and not busy else 0;last=cur
+            if stable>=8:
+                atomic(taskpath,{'account':name,'url':page.url,'status':'complete','reply':cur})
+                _persist(name,ctx)
+                for old in ctx.pages[:-1]:old.close()
+                return cur
+    raise ManualRequired('Ответ не завершился. Не посылаю платный запрос повторно автоматически.')
+
+
+def _parse_json(text):
+    cleaned=re.sub(r'^```(?:json)?\s*|\s*```$','',text.strip())
+    try:return json.loads(cleaned)
+    except ValueError:
+        decoder=json.JSONDecoder()
+        for m in re.finditer(r'[\[{]',cleaned):
+            try:return decoder.raw_decode(cleaned[m.start():])[0]
+            except ValueError:continue
+    raise BrowserLayoutError('Ответ не является JSON; повторный запрос автоматически не отправлен')
+
+
+def _rotate(fn):
+    acc=accounts()
+    if not acc:raise ManualRequired('Нет сессий. Запусти export-session и войди через удалённый экран.')
+    start=_state['next']%len(acc)
+    for k in range(len(acc)):
+        i=(start+k)%len(acc); name,st=acc[i]
+        if name in _state['blocked']:continue
         try:
-            for el in page.locator(sel).all():
-                try:
-                    t = (el.inner_text(timeout=2000) or "").strip()
-                    if len(t) > len(best):
-                        best = t
-                except Exception:  # noqa
-                    pass
-        except Exception:  # noqa
-            pass
-    return best
+            out=fn(name,st);_state['next']=(i+1)%len(acc);return out
+        except AccountUnavailable:
+            _state['blocked'].add(name);_state['next']=(i+1)%len(acc)
+            log(f'{name}: кредитов недостаточно; переход к следующему аккаунту.')
+    raise ManualRequired('Все включённые аккаунты сообщили о недостатке кредитов. Прогресс сохранён.')
 
 
-def _wait_answer(ctx, page, before, deadline):
-    """Ждём, пока ответ допишется: текст растёт и потом не меняется 4 секунды (стриминг закончился).
-    Если сайт открыл диалог в новой вкладке - читаем ответ там."""
-    last, stable = "", 0.0
-    while time.time() < deadline:
-        time.sleep(2)
-        cur_page = ctx.pages[-1] if len(ctx.pages) > 1 else page   # новая вкладка с диалогом
-        cur = _answer_text(cur_page)
-        if cur and cur != before:
-            if cur == last:
-                stable += 2
-                if stable >= 4 and len(cur) > 0:
-                    return cur
-            else:
-                stable, last = 0.0, cur
-    return ""
+def chat(prompt,as_json=True,search=False):
+    task='\nВерни только валидный JSON.' if as_json else ''
+    if search:task+='\nНайди факты в интернете и приложи ссылки на источники.'
+    body=prompt+task;pending=read(_text_task_path(body))
+    if pending.get('status')=='complete':text=pending['reply']
+    elif pending.get('account'):
+        acc=next(((n,s) for n,s in accounts_all() if n==pending['account']),None)
+        if not acc:raise ManualRequired('Аккаунт незавершённого текста недоступен; запрос повторно не отправлен')
+        text=_chat_one(*acc,body)
+    else:text=_rotate(lambda name,st:_chat_one(name,st,body))
+    return _parse_json(text) if as_json else text
 
 
-def _submitted(page, box, before):
-    """Признаки того, что промпт ушёл: поле очистилось, URL сменился (переход на страницу чата)
-    или начал рендериться ответ."""
-    try:
-        if _answer_text(page) != before:
-            return True
-        u = page.url.lower()
-        if "/agents/" in u or "/chat" in u:      # главная перебросила на страницу диалога
-            return True
-        if box and box.evaluate("el => (el.value || el.innerText || '').trim()") == "":
-            return True                           # сайт очистил поле после отправки
-    except Exception:  # noqa
-        pass
-    return False
+def inspect_video(path):
+    r=subprocess.run(['ffprobe','-v','error','-show_streams','-show_format','-of','json',str(path)],capture_output=True,text=True,check=True)
+    d=json.loads(r.stdout);v=next(s for s in d['streams'] if s['codec_type']=='video')
+    duration=float(d['format'].get('duration',v.get('duration',0)))
+    if duration<=0:raise BudgetMismatch('Видео пустое')
+    if abs(duration-anim_duration_s())>.35 or min(v['width'],v['height'])!=int(anim_quality()[:-1]):
+        raise BudgetMismatch('Скачанный клип не соответствует выбранной длительности/разрешению. Сохранён, повтор не запускается.')
+    return d
 
 
-def _submit(page, box, before):
-    """Отправка промпта: Enter; если за 8 с нет признаков отправки - клик по кнопке отправки."""
-    page.keyboard.press("Enter")
-    t0 = time.time()
-    while time.time() < t0 + 8:
-        time.sleep(1)
-        if _submitted(page, box, before):
-            return
-    try:
-        btn = _first(page, SEND_SELECTORS, 1500)
-        if btn:
-            btn.click()
-    except Exception:  # noqa
-        pass
-
-
-def _chat_one(account, storage, prompt, shots_dir):
-    """Один запрос одним аккаунтом. Возвращает текст ответа или бросает исключение."""
-    from playwright.sync_api import sync_playwright
-    errs = []
-    for attempt in range(retries_n()):
-        with sync_playwright() as pw:
-            browser = ctx = page = None
-            try:
-                browser = pw.chromium.launch(headless=True)
-                ctx = _new_ctx(browser, storage, account)
-                page = ctx.new_page()
-                page.set_default_timeout(page_timeout_ms())
-                page.goto(base_url(), wait_until="domcontentloaded")
-                page.wait_for_timeout(2500)                 # даём SPA отрисоваться
-                if _login_visible(page):
-                    page.screenshot(path=f"{shots_dir}/gs_fail_login.png")
-                    raise RuntimeError("сессия не принята: сайт показывает форму входа (gs_fail_login.png)")
-                box = _first(page, INPUT_SELECTORS, 20_000)
-                if box is None:
-                    page.screenshot(path=f"{shots_dir}/gs_fail_no_input.png")
-                    raise RuntimeError("не нашёл поле ввода чата (см. артефакт gs_fail_no_input.png)")
-                box.click()
-                if box.evaluate("el => el.tagName") == "TEXTAREA":
-                    box.fill(prompt[:8000])
+def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
+    # Manual UI selection is intentional: home-page HTML does NOT establish video generator selectors.
+    ctx=_context(name,storage)
+    key=hashlib.sha256(Path(image).read_bytes()+prompt.encode()).hexdigest()
+    taskpath=SESSIONS/f'task-{key}.json';pending=read(taskpath)
+    if pending.get('account') not in (None,name):raise ManualRequired('Эта сцена уже отправлена на другом аккаунте; дождись её результата, не создавай дубль.')
+    pg=_ready(name,ctx,pending.get('url') or video_url())
+    pg.bring_to_front()
+    atomic(taskpath,{'account':name,'url':pg.url,'status':'awaiting-human','settings':{'model':anim_model(),'duration':anim_duration_s(),'quality':anim_quality()}})
+    # File is uploaded ONLY if a real input exists. Never proceed image-to-video without image.
+    fi=pg.locator('input[type=file]').first
+    if fi.count():fi.set_input_files(str(image))
+    # Keep photo available in the private remote UI even when upload opens through a different agent.
+    human(f'{name}: ВИДЕО. Выбери {anim_model()}, {anim_duration_s()} с, {anim_quality()} в интерфейсе сайта. '
+          f'Прикрепи файл {Path(image).resolve()} (если не прикреплён). Промпт: {prompt}\n'
+          'Запусти генерацию ОДИН раз, дождись готовности. Если сцена уже отправлена — только дождись её. '
+          'Не включай более дорогую модель. После готовности нажми «Выполнено».',
+          on_tick=lambda:atomic(taskpath,{'account':name,'url':ctx.pages[-1].url,'status':'awaiting-human'}))
+    page=ctx.pages[-1];atomic(taskpath,{'account':name,'url':page.url,'status':'submitted'})
+    if quota(page):taskpath.unlink(missing_ok=True);raise AccountUnavailable('Кредитов недостаточно')
+    end=time.monotonic()+deadline_s
+    while time.monotonic()<end:
+        vids=page.locator('video').all()
+        if vids:
+            src=vids[-1].evaluate('el => el.currentSrc || el.src || el.querySelector("source")?.src || ""')
+            if src:
+                target=Path(out_path);target.parent.mkdir(parents=True,exist_ok=True)
+                tmp=target.with_suffix('.part.mp4')
+                if src.startswith('blob:'):
+                    data=page.evaluate('''async src => { const b=await (await fetch(src)).arrayBuffer();
+                      let x=''; const u=new Uint8Array(b); for(let i=0;i<u.length;i+=8192)x+=String.fromCharCode(...u.subarray(i,i+8192));return btoa(x);}''',src)
+                    tmp.write_bytes(base64.b64decode(data))
                 else:
-                    box.type(prompt[:8000], delay=8)
-                before = _answer_text(page)
-                _submit(page, box, before)
-                answer = _wait_answer(ctx, page, before, time.time() + timeout_s())
-                if not answer.strip():
-                    shot_page = ctx.pages[-1] if len(ctx.pages) > 1 else page
-                    shot_page.screenshot(path=f"{shots_dir}/gs_fail_no_answer.png")
-                    try:  # текст страницы в артефакт: видно, что сайт реально вернул
-                        with open(f"{shots_dir}/gs_fail_no_answer.txt", "w") as f:
-                            f.write(shot_page.evaluate("() => document.body.innerText")[:20000])
-                    except Exception:  # noqa
-                        pass
-                    raise RuntimeError(f"ответ не пришёл за {timeout_s()} с (см. gs_fail_no_answer.png/txt)")
-                page.screenshot(path=f"{shots_dir}/gs_ok.png")
-                return answer.strip()
-            except Exception as e:  # noqa
-                errs.append(str(e)[:180])
-                try:
-                    if page:
-                        page.screenshot(path=f"{shots_dir}/gs_fail_a{attempt}.png")
-                except Exception:  # noqa
-                    pass
-                log(f"genspark.ai {account}, попытка {attempt + 1}/{retries_n()} не удалась: {errs[-1]}")
-            finally:
-                try:
-                    if ctx:
-                        ctx.close()
-                    if browser:
-                        browser.close()
-                except Exception:  # noqa
-                    pass
-    raise RuntimeError("; ".join(errs[-2:]) or "неизвестная ошибка")
+                    resp=ctx.request.get(src,timeout=60000)
+                    if not resp.ok:raise ManualRequired('Не удалось скачать готовый клип; генерацию не повторяю')
+                    tmp.write_bytes(resp.body())
+                tmp.replace(target) # keep download even when budget mismatch
+                inspect_video(target)
+                taskpath.unlink(missing_ok=True);_persist(name,ctx)
+                return target
+        page.wait_for_timeout(1000)
+    raise ManualRequired('Готовый клип не найден. Задача сохранена, платную генерацию повторно не запускаю.')
 
 
-def _video_src(page):
-    """Адрес готового видео на странице: <video src> или <source src>.
-    blob: забираем прямо из страницы в base64 (так у сайта стримятся клипы)."""
-    try:
-        return page.evaluate(
-            """async () => {
-                const v = document.querySelector('video');
-                if (!v) return null;
-                const src = v.currentSrc || v.src || (v.querySelector('source') && v.querySelector('source').src);
-                if (!src) return null;
-                if (!src.startsWith('blob:')) return src;
-                const buf = await (await fetch(src)).arrayBuffer();
-                let bin = '';
-                const u8 = new Uint8Array(buf);
-                for (let i = 0; i < u8.length; i += 8192)
-                    bin += String.fromCharCode(...u8.subarray(i, i + 8192));
-                return 'data:video/mp4;base64,' + btoa(bin);
-            }""")
-    except Exception:  # noqa
-        return None
+def animate(image_path,prompt,out_path=None):
+    target=Path(out_path or 'work/anim.mp4')
+    if target.exists():inspect_video(target);return target
+    key=hashlib.sha256(Path(image_path).read_bytes()+prompt.encode()).hexdigest()
+    pending=read(SESSIONS/f'task-{key}.json')
+    owner=pending.get('account')
+    if owner:
+        match=next(((n,s) for n,s in accounts_all() if n==owner),None)
+        if not match:raise ManualRequired('Аккаунт начатого клипа недоступен; не отправляю сцену другому аккаунту повторно.')
+        return _animate_one(*match,image_path,prompt,None,target,video_timeout_s())
+    return _rotate(lambda name,st:_animate_one(name,st,image_path,prompt,None,target,video_timeout_s()))
 
 
-def _animate_one(account, storage, image_path, prompt, shots, out_path, deadline_s):
-    """Оживление одной картинки через сайт genspark.ai: прикрепляем фото, шлём промт,
-    ждём <video>, скачиваем mp4. Возвращает путь файла или бросает исключение."""
-    import pathlib
-    from playwright.sync_api import sync_playwright
-    pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    errs = []
-    for attempt in range(retries_n()):
-        with sync_playwright() as pw:
-            browser = ctx = page = None
-            try:
-                browser = pw.chromium.launch(headless=True)
-                ctx = _new_ctx(browser, storage, account)
-                page = ctx.new_page()
-                page.set_default_timeout(page_timeout_ms())
-                page.goto(video_url(), wait_until="domcontentloaded")
-                page.wait_for_timeout(2500)
-                if _login_visible(page):
-                    page.screenshot(path=f"{shots}/gv_fail_login.png")
-                    raise RuntimeError("сессия не принята (gv_fail_login.png)")
-                try:                      # прикрепляем картинку, если есть приёмник файлов
-                    fi = page.locator("input[type='file']").first
-                    if fi.count():
-                        fi.set_input_files(str(image_path))
-                        page.wait_for_timeout(1500)
-                except Exception:  # noqa
-                    log("кнопка загрузки файла не найдена - промт уйдёт без картинки")
-                box = _first(page, INPUT_SELECTORS, 20_000)
-                if box is None:
-                    page.screenshot(path=f"{shots}/gv_fail_no_input.png")
-                    raise RuntimeError("не нашёл поле ввода (gv_fail_no_input.png)")
-                box.click()
-                if box.evaluate("el => el.tagName") == "TEXTAREA":
-                    box.fill(prompt[:4000])
-                else:
-                    box.type(prompt[:4000], delay=8)
-                page.keyboard.press("Enter")
-                vsrc, dl = None, time.time() + deadline_s
-                while time.time() < dl:   # видео может рендериться на открывшейся вкладке агента
-                    time.sleep(5)
-                    for p in (ctx.pages[-1:] or [page]):
-                        vsrc = _video_src(p)
-                        if vsrc:
-                            break
-                    if vsrc:
-                        break
-                if not vsrc:
-                    (ctx.pages[-1] if len(ctx.pages) > 1 else page).screenshot(
-                        path=f"{shots}/gv_fail_no_video.png")
-                    raise RuntimeError(f"видео не появилось за {deadline_s} с (gv_fail_no_video.png)")
-                if vsrc.startswith("data:"):
-                    pathlib.Path(out_path).write_bytes(base64.b64decode(vsrc.split(",", 1)[1]))
-                else:
-                    resp = ctx.request.get(vsrc)
-                    if not resp.ok:
-                        raise RuntimeError(f"скачивание видео не удалось: HTTP {resp.status}")
-                    pathlib.Path(out_path).write_bytes(resp.body())
-                if pathlib.Path(out_path).stat().st_size < 10_000:
-                    raise RuntimeError("файл видео подозрительно мал, похоже на заглушку")
-                return out_path
-            except Exception as e:  # noqa
-                errs.append(str(e)[:180])
-                try:
-                    if page:
-                        page.screenshot(path=f"{shots}/gv_fail_a{attempt}.png")
-                except Exception:  # noqa
-                    pass
-                log(f"genspark видео {account}, попытка {attempt + 1}/{retries_n()} не удалась: {errs[-1]}")
-            finally:
-                try:
-                    if ctx:
-                        ctx.close()
-                    if browser:
-                        browser.close()
-                except Exception:  # noqa
-                    pass
-    raise RuntimeError("; ".join(errs[-2:]) or "неизвестная ошибка")
+def login_accounts():
+    for name,st in accounts():
+        ctx=_context(name,st);pg=_ready(name,ctx,base_url());pg.bring_to_front()
+        human(f'{name}: проверь, что открыт нужный аккаунт Genspark. Нажми «Выполнено» для сохранения сессии.')
+        if _login_visible(pg) or challenge(pg):raise ManualRequired('Вход не подтверждён')
+        _persist(name,ctx)
+    print('Сессии сохранены приватно; резерв будет зашифрован. Сами значения не выводятся.')
 
 
-def animate(image_path, prompt, out_path=None):
-    """Оживить картинку в видео через сайт genspark.ai (image-to-video).
-    Та же ротация аккаунтов, что и в chat(): сбойный пропускается; если все не ответили -
-    исключение, и main.py монтирует сцену статичным кадром с камерой, как раньше."""
-    accs = accounts()
-    if not accs:
-        raise RuntimeError("нет аккаунтов: секреты GENSPARK_STORAGES / GENSPARK_STORAGE_N не заданы")
-    if _state["dead"]:
-        raise RuntimeError("genspark.ai уже не ответил в этом запуске")
-    shots = os.environ.get("GENSPARK_SHOTS") or "work/genspark"
-    import pathlib
-    pathlib.Path(shots).mkdir(parents=True, exist_ok=True)
-    out = out_path or "work/genspark/anim.mp4"
-    body = (f"Оживи картинку в короткое видео моделью {anim_model()}. "
-            f"Длительность ролика ровно {anim_duration_s()} секунд, качество {anim_quality()}. "
-            f"Движение камеры и действие строго по описанию, без новых объектов и текста в кадре: {prompt}")
-    n = len(accs)
-    for rnd in range(rounds_n()):
-        for k in range(n):
-            i = (_state["next"] + k) % n
-            name, storage = accs[i]
-            try:
-                log(f"оживление картинки ({name}, раунд {rnd + 1}/{rounds_n()})...")
-                return _animate_one(name, storage, image_path, body, shots, out, video_timeout_s())
-            except Exception as e:  # noqa
-                log(f"{name} не оживил: {str(e)[:160]}")
-    raise RuntimeError("видео не получилось ни на одном аккаунте genspark.ai")
-
-
-def chat(prompt, as_json=True, search=False):
-    """Спросить сайт genspark.ai. Ответ - текст (или разобранный JSON при as_json=True).
-    Ротация без ограничения: кругами обходим все задействованные аккаунты, сбойный пропускается.
-    Когда сайт окончательно недоступен, main.py сам возвращается на Gemini API."""
-    accs = accounts()
-    if not accs:
-        raise RuntimeError("нет аккаунтов: секреты GENSPARK_STORAGE_1..N не заданы")
-    if _state["dead"]:
-        raise RuntimeError("genspark.ai уже не ответил в этом запуске")
-    shots = os.environ.get("GENSPARK_SHOTS") or "work/genspark"
-    import pathlib
-    pathlib.Path(shots).mkdir(parents=True, exist_ok=True)
-    task = ("Найди в интернете и ответь, прикладывай ссылки на источники."
-            if search else "Ответь строго валидным JSON без пояснений." if as_json else "")
-    body = f"{prompt}\n\n{task}".strip() if task else prompt
-    n = len(accs)
-    for rnd in range(rounds_n()):
-        for k in range(n):
-            i = (_state["next"] + k) % n
-            name, storage = accs[i]
-            try:
-                log(f"запрос к genspark.ai ({name}, раунд {rnd + 1}/{rounds_n()}, позиция {i + 1}/{n})...")
-                text = _chat_one(name, storage, body, shots)
-                _state["next"] = i                     # следующий запрос начнёт с этого же аккаунта
-                if as_json:
-                    t = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-                    a, b = t.find("{"), t.rfind("}")
-                    if a >= 0 and b > a:
-                        t = t[a:b + 1]
-                    return json.loads(t)
-                return text
-            except Exception as e:  # noqa
-                log(f"{name} не ответил: {str(e)[:160]}")
-    _state["dead"] = True
-    traceback.print_exc()
-    raise RuntimeError("ни один аккаунт genspark.ai не ответил")
-
-
-if __name__ == "__main__":
+if __name__=='__main__':
     import sys
-    q = " ".join(sys.argv[1:]) or "Скажи привет одним предложением."
-    print(chat(q, as_json=False))
+    if len(sys.argv)>1 and sys.argv[1]=='login':login_accounts()
+    else:print(chat(' '.join(sys.argv[1:]) or 'Скажи привет.',as_json=False))
