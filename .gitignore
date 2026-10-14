@@ -1,0 +1,11 @@
+
+# Credentials and encrypted progress are never committed
+private-runtime/
+state-backup/
+data/jobs/
+work/
+__pycache__/
+genspark_session*.json
+sess*.json
+cookies*.txt
+*.b64
