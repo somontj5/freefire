@@ -1,136 +1,153 @@
 name: create
-on:
-  workflow_dispatch:
-    inputs:
-      topic:
-        description: "Тема ролика (пусто = случайная)"
-        required: false
-        default: ""
-      script:
-        description: "Готовый сценарий (пусто = бот пишет сам)"
-        required: false
-        default: ""
-
 concurrency:
-  group: create
+  group: browser-${{ github.ref_name }}
   cancel-in-progress: false
-
 permissions:
   contents: write
-
+  actions: read
 jobs:
   create:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - name: Install ffmpeg and fonts
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-montserrat
-      - name: Cache rembg model
-        uses: actions/cache@v4
-        with:
-          path: ~/.u2net
-          key: u2net-v1
-      - name: Cache synthesized music
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/freefire_music
-          key: fxmusic-v1
-      - name: Cache Whisper model
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: whisper-small-v1
-      - run: pip install -r requirements.txt gradio_client
-      - name: Install Playwright Chromium (для сайта genspark.ai)
-        run: python -m playwright install --with-deps chromium
-      - name: Create video
-        run: python main.py create
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          PUTER_AUTH_TOKEN: ${{ secrets.PUTER_AUTH_TOKEN }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_TOKEN1: ${{ secrets.HF_TOKEN1 }}
-          HF_TOKEN2: ${{ secrets.HF_TOKEN2 }}
-          HF_TOKEN3: ${{ secrets.HF_TOKEN3 }}
-          HF_TOKEN4: ${{ secrets.HF_TOKEN4 }}
-          HF_TOKEN5: ${{ secrets.HF_TOKEN5 }}
-          HF_TOKEN6: ${{ secrets.HF_TOKEN6 }}
-          TOPIC: ${{ inputs.topic }}
-          SCRIPT_TEXT: ${{ inputs.script }}
-          RESUME: ${{ vars.RESUME }}
-          AUTO_PUBLISH: ${{ vars.AUTO_PUBLISH }}
-          VIDEO_MODE: ${{ vars.VIDEO_MODE }}
-          PHOTO_ZOOM: ${{ vars.PHOTO_ZOOM }}
-          STORY_TYPE: ${{ vars.STORY_TYPE }}
-          CHAR_REF: ${{ vars.CHAR_REF }}
-          TTS_VOICE: ${{ vars.TTS_VOICE }}
-          TTS_PROVIDER: ${{ vars.TTS_PROVIDER }}
-          SCRIPT_WRITER: ${{ vars.SCRIPT_WRITER }}
-          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
-          GEMINI_SCRIPT_MODEL: ${{ vars.GEMINI_SCRIPT_MODEL }}
-          GEMINI_VOICE: ${{ vars.GEMINI_VOICE }}
-          GEMINI_TTS_MODEL: ${{ vars.GEMINI_TTS_MODEL }}
-          TAVILY_DEPTH: ${{ vars.TAVILY_DEPTH }}
-          NO_SEARCH: ${{ vars.NO_SEARCH }}
-          HF_SPACE: ${{ vars.HF_SPACE }}
-          HF_STEPS: ${{ vars.HF_STEPS }}
-          IMAGE_PROVIDER: ${{ vars.IMAGE_PROVIDER }}
-          INSTANTID: ${{ vars.INSTANTID }}
-          HORDE_API_KEY: ${{ secrets.HORDE_API_KEY }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID1: ${{ secrets.CF_ACCOUNT_ID1 }}
-          CF_API_TOKEN1: ${{ secrets.CF_API_TOKEN1 }}
-          CF_ACCOUNT_ID2: ${{ secrets.CF_ACCOUNT_ID2 }}
-          CF_API_TOKEN2: ${{ secrets.CF_API_TOKEN2 }}
-          CF_ACCOUNT_ID3: ${{ secrets.CF_ACCOUNT_ID3 }}
-          CF_API_TOKEN3: ${{ secrets.CF_API_TOKEN3 }}
-          # Сайт genspark.ai вместо API: аккаунты (без ограничения по количеству) и их сессии
-          GENSPARK_ACCOUNTS: ${{ vars.GENSPARK_ACCOUNTS }}
-          GENSPARK_URL: ${{ vars.GENSPARK_URL }}
-          GENSPARK_TIMEOUT: ${{ vars.GENSPARK_TIMEOUT }}
-          GENSPARK_RETRIES: ${{ vars.GENSPARK_RETRIES }}
-          GENSPARK_ROUNDS: ${{ vars.GENSPARK_ROUNDS }}
-          GENSPARK_STORAGES: ${{ secrets.GENSPARK_STORAGES }}
-          GENSPARK_STORAGE_1: ${{ secrets.GENSPARK_STORAGE_1 }}
-          GENSPARK_STORAGE_2: ${{ secrets.GENSPARK_STORAGE_2 }}
-          GENSPARK_STORAGE_3: ${{ secrets.GENSPARK_STORAGE_3 }}
-          GENSPARK_STORAGE_4: ${{ secrets.GENSPARK_STORAGE_4 }}
-          GENSPARK_STORAGE_5: ${{ secrets.GENSPARK_STORAGE_5 }}
-          GENSPARK_STORAGE_6: ${{ secrets.GENSPARK_STORAGE_6 }}
-          GENSPARK_STORAGE_7: ${{ secrets.GENSPARK_STORAGE_7 }}
-          GENSPARK_STORAGE_8: ${{ secrets.GENSPARK_STORAGE_8 }}
-          GENSPARK_STORAGE_9: ${{ secrets.GENSPARK_STORAGE_9 }}
-          GENSPARK_STORAGE_10: ${{ secrets.GENSPARK_STORAGE_10 }}
-          # Оживление кадров: сайт genspark.ai превращает картинку сцены в видео
-          # (по умолчанию Grok lite, 3 с, 480p; эти значения перекрывает /настройки бота из data/settings.json)
-          ANIMATE: ${{ vars.ANIMATE }}
-          MAX_ANIMATE: ${{ vars.MAX_ANIMATE }}
-          GENSPARK_ANIM_MODEL: ${{ vars.GENSPARK_ANIM_MODEL }}
-          GENSPARK_ANIM_DURATION: ${{ vars.GENSPARK_ANIM_DURATION }}
-          GENSPARK_ANIM_QUALITY: ${{ vars.GENSPARK_ANIM_QUALITY }}
-          GENSPARK_VIDEO_TIMEOUT: ${{ vars.GENSPARK_VIDEO_TIMEOUT }}
-          GENSPARK_VIDEO_URL: ${{ vars.GENSPARK_VIDEO_URL }}
-          IMG2IMG_SPACE: ${{ vars.IMG2IMG_SPACE }}
-          IMG2IMG_STRENGTH: ${{ vars.IMG2IMG_STRENGTH }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Save data (history, heroes)
-        if: always()
-        run: |
-          git config user.name "video-bot"
-          git config user.email "video-bot@users.noreply.github.com"
-          git add data characters 2>/dev/null || true
-          git diff --cached --quiet && exit 0
-          git commit -m "data: update"
-          for i in 1 2 3 4; do git pull --rebase -q && git push -q && break; sleep 3; done
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: pip
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements.txt
+    - name: Validate encrypted backup secret
+      run: python runner_state.py validate-key
+    - name: Restore previous encrypted progress
+      run: python runner_state.py restore
+    - name: Install desktop and media tools
+      run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core xvfb x11vnc novnc websockify fluxbox x11-utils
+    - name: Install Chromium
+      run: python -m playwright install --with-deps chromium
+    - name: Connect private Tailscale network
+      uses: tailscale/github-action@v4
+      with:
+        oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+        oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+        tags: tag:ci
+        hostname: ff-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Start private remote desktop
+      run: bash runner_remote.sh
+    - name: Create video
+      run: python run_job.py create
+    - name: Encrypt progress and sessions
+      if: always()
+      run: python runner_state.py snapshot
+    - name: Upload encrypted checkpoint
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: freefire-state-${{ github.run_id }}-${{ github.run_attempt }}
+        path: state-backup/state.enc
+        if-no-files-found: warn
+        retention-days: 14
+    - name: Save non-secret history and settings
+      if: always()
+      run: bash save_data.sh
+    - name: Close private remote access
+      if: always()
+      run: sudo tailscale serve reset || true
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+      POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      PUTER_AUTH_TOKEN: ${{ secrets.PUTER_AUTH_TOKEN }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TOKEN1: ${{ secrets.HF_TOKEN1 }}
+      HF_TOKEN2: ${{ secrets.HF_TOKEN2 }}
+      HF_TOKEN3: ${{ secrets.HF_TOKEN3 }}
+      HF_TOKEN4: ${{ secrets.HF_TOKEN4 }}
+      HF_TOKEN5: ${{ secrets.HF_TOKEN5 }}
+      HF_TOKEN6: ${{ secrets.HF_TOKEN6 }}
+      TOPIC: ${{ inputs.topic }}
+      SCRIPT_TEXT: ${{ inputs.script }}
+      RESUME: ${{ vars.RESUME }}
+      AUTO_PUBLISH: ${{ vars.AUTO_PUBLISH }}
+      VIDEO_MODE: ${{ vars.VIDEO_MODE }}
+      PHOTO_ZOOM: ${{ vars.PHOTO_ZOOM }}
+      STORY_TYPE: ${{ vars.STORY_TYPE }}
+      CHAR_REF: ${{ vars.CHAR_REF }}
+      TTS_VOICE: ${{ vars.TTS_VOICE }}
+      TTS_PROVIDER: ${{ vars.TTS_PROVIDER }}
+      SCRIPT_WRITER: ${{ vars.SCRIPT_WRITER }}
+      CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+      GEMINI_SCRIPT_MODEL: ${{ vars.GEMINI_SCRIPT_MODEL }}
+      GEMINI_VOICE: ${{ vars.GEMINI_VOICE }}
+      GEMINI_TTS_MODEL: ${{ vars.GEMINI_TTS_MODEL }}
+      TAVILY_DEPTH: ${{ vars.TAVILY_DEPTH }}
+      NO_SEARCH: ${{ vars.NO_SEARCH }}
+      HF_SPACE: ${{ vars.HF_SPACE }}
+      HF_STEPS: ${{ vars.HF_STEPS }}
+      IMAGE_PROVIDER: ${{ vars.IMAGE_PROVIDER }}
+      INSTANTID: ${{ vars.INSTANTID }}
+      HORDE_API_KEY: ${{ secrets.HORDE_API_KEY }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ACCOUNT_ID1: ${{ secrets.CF_ACCOUNT_ID1 }}
+      CF_API_TOKEN1: ${{ secrets.CF_API_TOKEN1 }}
+      CF_ACCOUNT_ID2: ${{ secrets.CF_ACCOUNT_ID2 }}
+      CF_API_TOKEN2: ${{ secrets.CF_API_TOKEN2 }}
+      CF_ACCOUNT_ID3: ${{ secrets.CF_ACCOUNT_ID3 }}
+      CF_API_TOKEN3: ${{ secrets.CF_API_TOKEN3 }}
+      GENSPARK_ACCOUNTS: ${{ vars.GENSPARK_ACCOUNTS }}
+      GENSPARK_URL: ${{ vars.GENSPARK_URL }}
+      GENSPARK_TIMEOUT: ${{ vars.GENSPARK_TIMEOUT }}
+      GENSPARK_RETRIES: ${{ vars.GENSPARK_RETRIES }}
+      GENSPARK_ROUNDS: ${{ vars.GENSPARK_ROUNDS }}
+      GENSPARK_STORAGES: ${{ secrets.GENSPARK_STORAGES }}
+      GENSPARK_STORAGE_1: ${{ secrets.GENSPARK_STORAGE_1 }}
+      GENSPARK_STORAGE_2: ${{ secrets.GENSPARK_STORAGE_2 }}
+      GENSPARK_STORAGE_3: ${{ secrets.GENSPARK_STORAGE_3 }}
+      GENSPARK_STORAGE_4: ${{ secrets.GENSPARK_STORAGE_4 }}
+      GENSPARK_STORAGE_5: ${{ secrets.GENSPARK_STORAGE_5 }}
+      GENSPARK_STORAGE_6: ${{ secrets.GENSPARK_STORAGE_6 }}
+      GENSPARK_STORAGE_7: ${{ secrets.GENSPARK_STORAGE_7 }}
+      GENSPARK_STORAGE_8: ${{ secrets.GENSPARK_STORAGE_8 }}
+      GENSPARK_STORAGE_9: ${{ secrets.GENSPARK_STORAGE_9 }}
+      GENSPARK_STORAGE_10: ${{ secrets.GENSPARK_STORAGE_10 }}
+      ANIMATE: ${{ vars.ANIMATE }}
+      MAX_ANIMATE: ${{ vars.MAX_ANIMATE }}
+      GENSPARK_ANIM_MODEL: ${{ vars.GENSPARK_ANIM_MODEL }}
+      GENSPARK_ANIM_DURATION: ${{ vars.GENSPARK_ANIM_DURATION }}
+      GENSPARK_ANIM_QUALITY: ${{ vars.GENSPARK_ANIM_QUALITY }}
+      GENSPARK_VIDEO_TIMEOUT: ${{ vars.GENSPARK_VIDEO_TIMEOUT }}
+      GENSPARK_VIDEO_URL: ${{ vars.GENSPARK_VIDEO_URL }}
+      IMG2IMG_SPACE: ${{ vars.IMG2IMG_SPACE }}
+      IMG2IMG_STRENGTH: ${{ vars.IMG2IMG_STRENGTH }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GENSPARK_MANUAL_WAIT: ${{ vars.GENSPARK_MANUAL_WAIT }}
+      GENSPARK_ALLOW_FALLBACK: ${{ vars.GENSPARK_ALLOW_FALLBACK }}
+      GENSPARK_INPUT_SELECTOR: ${{ vars.GENSPARK_INPUT_SELECTOR }}
+      GENSPARK_ANSWER_SELECTOR: ${{ vars.GENSPARK_ANSWER_SELECTOR }}
+      TG_ADMIN_ID: ${{ secrets.TG_ADMIN_ID }}
+      GENSPARK_REMOTE: '1'
+      GENSPARK_HEADLESS: '0'
+      SESSION_BACKUP_KEY: ${{ secrets.SESSION_BACKUP_KEY }}
+      REMOTE_DESKTOP_PASSWORD: ${{ secrets.REMOTE_DESKTOP_PASSWORD }}
+      DISPLAY: :99
+      GENSPARK_FINAL_EDITOR: ${{ vars.GENSPARK_FINAL_EDITOR }}
+      GENSPARK_EDITOR_TIMEOUT: ${{ vars.GENSPARK_EDITOR_TIMEOUT }}
+      GENSPARK_FINAL_DOWNLOAD_SELECTOR: ${{ vars.GENSPARK_FINAL_DOWNLOAD_SELECTOR }}
+'on':
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: Тема ролика (пусто = случайная)
+        required: false
+        default: ''
+      script:
+        description: Готовый сценарий (пусто = бот пишет сам)
+        required: false
+        default: ''
