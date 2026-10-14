@@ -23,16 +23,28 @@ SAME_SITE = {"no_restriction": "None", "none": "None", "lax": "Lax",
 
 def normalize(c):
     ss = str(c.get("sameSite") or "").lower()
+    ss = {"no_restriction": "None", "none": "None", "lax": "Lax",
+          "strict": "Strict", "unspecified": "Lax"}.get(ss, "Lax")
     exp = c.get("expirationDate") or c.get("expires") or -1
     try:
         exp = float(exp)
     except Exception:  # noqa
         exp = -1
-    return {"name": str(c["name"]), "value": str(c.get("value", "")),
-            "domain": str(c.get("domain") or DEFAULT_DOMAIN),
-            "path": str(c.get("path") or "/"), "expires": exp,
-            "httpOnly": bool(c.get("httpOnly", False)), "secure": bool(c.get("secure", True)),
-            "sameSite": SAME_SITE.get(ss, "Lax")}
+    if exp != -1 and exp <= 0:
+        exp = -1                       # expires=0 Chromium считает битым
+    secure = bool(c.get("secure", False))
+    if ss == "None":
+        secure = True                  # SameSite=None без Secure Chromium отвергает
+    name = str(c.get("name") or "")
+    if name.startswith("__Secure-"):
+        secure = True
+    path, domain = str(c.get("path") or "/"), str(c.get("domain") or DEFAULT_DOMAIN)
+    if name.startswith("__Host-"):
+        secure, path, domain = True, "/", domain.lstrip(".")   # правила префикса __Host-
+    return {"name": name, "value": str(c.get("value", "")),
+            "domain": domain, "path": path or "/", "expires": exp,
+            "httpOnly": bool(c.get("httpOnly", False)), "secure": secure,
+            "sameSite": ss}
 
 
 def netscape_cookies(text):
