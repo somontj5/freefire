@@ -182,6 +182,63 @@ def _first(page, selectors, timeout_ms=8000):
     return None
 
 
+def _sanitize_cookie(c):
+    """Кука, которую Chromium точно примет, или None (без имени/домена - брак).
+    Cookie Editor часто отдаёт поля, из-за которых Storage.setCookies отвергает ВЕСЬ набор:
+    SameSite=None без Secure, expires=0, строгие префиксы __Host-/__Secure-."""
+    name = str(c.get("name") or "").strip()
+    value = str(c.get("value") or "")
+    domain = str(c.get("domain") or "").strip()
+    if not name or not value or not domain:
+        return None
+    path = str(c.get("path") or "/").strip() or "/"
+    ss = str(c.get("sameSite") or "").strip()
+    ss = ss if ss in ("None", "Lax", "Strict") else "Lax"
+    try:
+        expires = float(c.get("expires", -1))
+    except Exception:  # noqa
+        expires = -1.0
+    if expires != -1 and expires <= 0:
+        expires = -1.0                      # expires=0 Chromium считает битым
+    secure = bool(c.get("secure", False))
+    if ss == "None":
+        secure = True                       # SameSite=None требует Secure
+    if name.startswith("__Secure-"):
+        secure = True
+    if name.startswith("__Host-"):
+        secure, path, domain = True, "/", domain.lstrip(".")   # host-only кука
+    return {"name": name, "value": value, "domain": domain, "path": path,
+            "expires": expires, "httpOnly": bool(c.get("httpOnly", False)),
+            "secure": secure, "sameSite": ss}
+
+
+def _new_ctx(browser, storage, tag):
+    """Контекст браузера с куками аккаунта. Сначала подаём чищеный набор целиком;
+    если Chromium и его не принял - добавляем куки по одной, пропуская битые
+    (localStorage сохраняется в обоих случаях)."""
+    origins = storage.get("origins") or []
+    clean = [s for s in (_sanitize_cookie(c) for c in (storage.get("cookies") or [])) if s]
+    try:
+        return browser.new_context(storage_state={"cookies": clean, "origins": origins},
+                                   viewport={"width": 1366, "height": 900}, locale="en-US")
+    except Exception as e:  # noqa
+        if "cookie" not in str(e).lower():
+            raise
+        log(f"{tag}: набор кук не принят целиком ({str(e)[:110]}), добавляю по одной, пропуская битые")
+        ctx = browser.new_context(storage_state={"cookies": [], "origins": origins},
+                                  viewport={"width": 1366, "height": 900}, locale="en-US")
+        dropped = []
+        for c in clean:
+            try:
+                ctx.add_cookies([c])
+            except Exception:  # noqa
+                dropped.append(c["name"])
+        if dropped:
+            log(f"{tag}: Chromium не принял куки (пропущены): {', '.join(dropped[:8])}"
+                + ("..." if len(dropped) > 8 else ""))
+        return ctx
+
+
 def _login_visible(page):
     """Сессия не принята: редирект на вход, диалог входа или кнопка «Войти»/«Sign in» на странице."""
     try:
@@ -286,8 +343,7 @@ def _chat_one(account, storage, prompt, shots_dir):
             browser = ctx = page = None
             try:
                 browser = pw.chromium.launch(headless=True)
-                ctx = browser.new_context(storage_state=storage, viewport={"width": 1366, "height": 900},
-                                          locale="en-US")
+                ctx = _new_ctx(browser, storage, account)
                 page = ctx.new_page()
                 page.set_default_timeout(page_timeout_ms())
                 page.goto(base_url(), wait_until="domcontentloaded")
@@ -371,8 +427,7 @@ def _animate_one(account, storage, image_path, prompt, shots, out_path, deadline
             browser = ctx = page = None
             try:
                 browser = pw.chromium.launch(headless=True)
-                ctx = browser.new_context(storage_state=storage, viewport={"width": 1366, "height": 900},
-                                          locale="en-US")
+                ctx = _new_ctx(browser, storage, account)
                 page = ctx.new_page()
                 page.set_default_timeout(page_timeout_ms())
                 page.goto(video_url(), wait_until="domcontentloaded")
