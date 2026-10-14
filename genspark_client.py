@@ -204,13 +204,36 @@ def quota(page):
     return any(s in text for s in ('insufficient credits','not enough credits','daily limit reached','недостаточно кредитов','дневной лимит исчерпан'))
 
 
-def notify(message):
+def notify(message,markup=None):
     if os.environ.get('TG_TOKEN') and os.environ.get('TG_CHAT_ID'):
         import requests
         try:
             requests.post('https://api.telegram.org/bot'+os.environ['TG_TOKEN']+'/sendMessage',
-                          json={'chat_id':os.environ['TG_CHAT_ID'],'text':message},timeout=15)
+                          json={'chat_id':os.environ['TG_CHAT_ID'],'text':message,**({'reply_markup':markup} if markup else {})},timeout=15)
         except Exception:log('Не удалось отправить уведомление; ссылки в Summary Actions.')
+
+
+_telegram_offset=None
+
+
+def _telegram_tick():
+    global _telegram_offset
+    if not os.environ.get('TG_TOKEN') or not os.environ.get('TG_CHAT_ID'):return
+    import requests
+    import main as api
+    base='https://api.telegram.org/bot'+os.environ['TG_TOKEN']+'/'
+    params={'timeout':0,'allowed_updates':'["message","callback_query"]'}
+    if _telegram_offset is not None:params['offset']=_telegram_offset
+    try:
+        result=requests.get(base+'getUpdates',params=params,timeout=8).json()
+        if not result.get('ok'):return
+        for update in result.get('result',[]):
+            _telegram_offset=update['update_id']+1
+            if 'callback_query' in update:api.handle_callback(update['callback_query'])
+            elif 'message' in update:api.handle_message(update['message'])
+        if result.get('result'):
+            requests.get(base+'getUpdates',params={'offset':_telegram_offset,'timeout':0},timeout=8)
+    except Exception:log('Telegram временно недоступен; резервная панель остаётся по приватной ссылке.')
 
 
 def human(message,on_tick=None):
@@ -218,11 +241,22 @@ def human(message,on_tick=None):
     rid=uuid.uuid4().hex
     atomic(PRIVATE/'request.json',{'id':rid,'message':message})
     control=os.environ['GENSPARK_REMOTE_CONTROL']; screen=os.environ.get('GENSPARK_REMOTE_SCREEN','')
-    notify(f'🖥 {message}\nЭкран: {screen}\nПодтвердить / остановить: {control}\nОжидание: {number("GENSPARK_MANUAL_WAIT")} с. Телефон не выполняет вычисления.')
-    log('Ожидаю ручное действие. Открой ссылки в Summary Actions / Telegram.')
+    rows=[]
+    if screen:rows.append([{'text':'🌐 Открыть браузер','url':screen}])
+    rows.append([{'text':'✅ Выполнено — продолжить','callback_data':f'cf:{rid}:continue'},
+                 {'text':'⏸ Сохранить и остановить','callback_data':f'cf:{rid}:pause'}])
+    rows.append([{'text':'⚙️ Меню','callback_data':'m:home'}])
+    notify(f'🖥 {message}\nОжидание: {number("GENSPARK_MANUAL_WAIT")} с. '
+           'Открой браузер кнопкой, подтверди вручную, затем нажми «Выполнено». GitHub/Summary открывать не нужно.',
+           {'inline_keyboard':rows})
+    log('Ожидаю ручное действие — кнопки отправлены в Telegram.')
     end=time.monotonic()+number('GENSPARK_MANUAL_WAIT')
+    next_poll=0
     while time.monotonic()<end:
         if on_tick:on_tick()
+        if time.monotonic()>=next_poll:
+            _telegram_tick()
+            next_poll=time.monotonic()+2
         d=read(PRIVATE/'approval.json')
         if d.get('id')==rid:
             atomic(PRIVATE/'request.json',{'message':'Действие принято'})
@@ -328,7 +362,9 @@ def _rotate(fn):
 def chat(prompt,as_json=True,search=False):
     task='\nВерни только валидный JSON.' if as_json else ''
     if search:task+='\nНайди факты в интернете и приложи ссылки на источники.'
-    body=prompt+task;pending=read(_text_task_path(body))
+    prefix=('Текстовый этап: используй Claude для анализа/сценария/промптов. '
+            'Не запускай генерацию картинок, видео или музыки в этом текстовом запросе.\n')
+    body=prefix+prompt+task;pending=read(_text_task_path(body))
     if pending.get('status')=='complete':text=pending['reply']
     elif pending.get('account'):
         acc=next(((n,s) for n,s in accounts_all() if n==pending['account']),None)
@@ -357,19 +393,42 @@ def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
     pg=_ready(name,ctx,pending.get('url') or video_url())
     pg.bring_to_front()
     atomic(taskpath,{'account':name,'url':pg.url,'status':'awaiting-human','settings':{'model':anim_model(),'duration':anim_duration_s(),'quality':anim_quality()}})
-    # File is uploaded ONLY if a real input exists. Never proceed image-to-video without image.
-    fi=pg.locator('input[type=file]').first
-    if fi.count():fi.set_input_files(str(image))
-    # Keep photo available in the private remote UI even when upload opens through a different agent.
-    human(f'{name}: ВИДЕО. Выбери {anim_model()}, {anim_duration_s()} с, {anim_quality()} в интерфейсе сайта. '
-          f'Прикрепи файл {Path(image).resolve()} (если не прикреплён). Промпт: {prompt}\n'
-          'Запусти генерацию ОДИН раз, дождись готовности. Если сцена уже отправлена — только дождись её. '
-          'Не включай более дорогую модель. После готовности нажми «Выполнено».',
-          on_tick=lambda:atomic(taskpath,{'account':name,'url':ctx.pages[-1].url,'status':'awaiting-human'}))
+    mode=os.environ.get('GENSPARK_VIDEO_MODE') or 'agent'
+    instructions=(f'Используй инструмент генерации видео: модель {anim_model()}, ровно {anim_duration_s()} секунд, '
+                  f'{anim_quality()}, один image-to-video клип из приложенной картинки. '
+                  'Не подменяй модель более дорогой и не делай вариации. '
+                  'Если указанные параметры недоступны, остановись и сообщи, не трать кредиты. '
+                  f'Движение: {prompt}')
+    if mode=='agent' and not pending:
+        fi=pg.locator('input[type=file]').first
+        if not fi.count():
+            raise ManualRequired('На главном экране не найден приёмник фото. Требуется один раз показать реальный UI прикрепления.')
+        fi.set_input_files(str(image))
+        pg.wait_for_timeout(1500)
+        inp=_first(pg,INPUT_SELECTORS)
+        if inp is None:raise BrowserLayoutError('Не найдено поле агента')
+        inp.fill(instructions)
+        atomic(taskpath,{'account':name,'url':pg.url,'status':'submitted'})
+        inp.press('Enter') # exactly one submission, no expensive automatic retries
+    elif mode=='agent' and pending.get('status')=='submitted':
+        pass # task already sent: wait, don't submit twice
+    else:
+        fi=pg.locator('input[type=file]').first
+        if fi.count() and not pending:fi.set_input_files(str(image))
+        inp=_first(pg,INPUT_SELECTORS,2000)
+        if inp is not None and not pending:inp.fill(instructions)
+        human(f'{name}: видео. Задание заполнено на главном экране: {instructions}\n'
+              f'Фото на сервере: {Path(image).resolve()}. Запусти один раз, дождись готовности, нажми «Выполнено».',
+              on_tick=lambda:atomic(taskpath,{'account':name,'url':ctx.pages[-1].url,'status':'awaiting-human'}))
     page=ctx.pages[-1];atomic(taskpath,{'account':name,'url':page.url,'status':'submitted'})
     if quota(page):taskpath.unlink(missing_ok=True);raise AccountUnavailable('Кредитов недостаточно')
     end=time.monotonic()+deadline_s
     while time.monotonic()<end:
+        page=ctx.pages[-1]
+        atomic(taskpath,{'account':name,'url':page.url,'status':'submitted'})
+        if challenge(page) or _login_visible(page):
+            page.bring_to_front();human('Пройди проверку / вход кнопкой «Открыть браузер», затем «Выполнено».')
+        if quota(page):taskpath.unlink(missing_ok=True);raise AccountUnavailable('Кредитов недостаточно')
         vids=page.locator('video').all()
         if vids:
             src=vids[-1].evaluate('el => el.currentSrc || el.src || el.querySelector("source")?.src || ""')
