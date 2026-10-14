@@ -7,3 +7,4 @@ gradio_client
 faster-whisper
 numpy
 playwright
+cryptography>=43
