@@ -1,93 +1,70 @@
 name: export-session
-on:
-  workflow_dispatch:
-    inputs:
-      cookies:
-        description: "Куки genspark.ai (JSON Cookie Editor или строки name=value). Пусто = только проверка already-заданных секретов"
-        required: false
-        default: ""
-      verify_client:
-        description: "Проверить клиента genspark_client тестовым вопросом"
-        required: false
-        default: "true"
-
+'on':
+  workflow_dispatch: {}
 concurrency:
-  group: export-session
-  cancel-in-progress: true
-
+  group: browser-${{ github.ref_name }}
+  cancel-in-progress: false
 permissions:
   contents: write
-
+  actions: read
 jobs:
-  export:
+  login:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      GENSPARK_ACCOUNTS: ${{ vars.GENSPARK_ACCOUNTS }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GENSPARK_MANUAL_WAIT: ${{ vars.GENSPARK_MANUAL_WAIT }}
+      GENSPARK_REMOTE: '1'
+      GENSPARK_HEADLESS: '0'
+      SESSION_BACKUP_KEY: ${{ secrets.SESSION_BACKUP_KEY }}
+      REMOTE_DESKTOP_PASSWORD: ${{ secrets.REMOTE_DESKTOP_PASSWORD }}
+      DISPLAY: :99
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -q playwright requests
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
-      - name: Collect session from cookies
-        if: ${{ inputs.cookies != '' }}
-        env:
-          COOKIES: ${{ inputs.cookies }}
-        run: |
-          python - <<'EOF'
-          import os, pathlib
-          raw = os.environ.get("COOKIES", "").strip()
-          if raw:
-              pathlib.Path("cookies.txt").write_text(raw, encoding="utf-8")
-              print("куки получены из формы запуска")
-          else:
-              print("куки не переданы")
-          EOF
-          if [ -s cookies.txt ]; then python export_from_cookies.py cookies.txt -o genspark_session.json; fi
-      - name: Verify saved secrets (GENSPARK_STORAGE_1..3 / GENSPARK_STORAGES)
-        if: ${{ inputs.cookies == '' }}
-        env:
-          GENSPARK_ACCOUNTS: "all"
-          GENSPARK_STORAGES: ${{ secrets.GENSPARK_STORAGES }}
-          GENSPARK_STORAGE_1: ${{ secrets.GENSPARK_STORAGE_1 }}
-          GENSPARK_STORAGE_2: ${{ secrets.GENSPARK_STORAGE_2 }}
-          GENSPARK_STORAGE_3: ${{ secrets.GENSPARK_STORAGE_3 }}
-        run: |
-          python - <<'EOF'
-          import genspark_client as gc
-          accs = gc.accounts_all()
-          print(f"найдено аккаунтов: {len(accs)}")
-          for name, _ in accs:
-              print(" -", name)
-          if not accs:
-              print("НИ ОДНОГО: экспортируй сессию через форму запуска (поле cookies)")
-          EOF
-      - name: Live test of genspark_client
-        if: ${{ inputs.verify_client == 'true' }}
-        env:
-          GENSPARK_ACCOUNTS: ${{ vars.GENSPARK_ACCOUNTS }}
-          GENSPARK_STORAGES: ${{ secrets.GENSPARK_STORAGES }}
-          GENSPARK_STORAGE_1: ${{ secrets.GENSPARK_STORAGE_1 }}
-          GENSPARK_STORAGE_2: ${{ secrets.GENSPARK_STORAGE_2 }}
-          GENSPARK_STORAGE_3: ${{ secrets.GENSPARK_STORAGE_3 }}
-          GENSPARK_TIMEOUT: "240"
-          GENSPARK_RETRIES: "1"
-        run: |
-          python - <<'EOF'
-          import genspark_client as gc
-          accs = gc.accounts_all()
-          if not accs:
-              print("Пропускаю: секретов сессий нет")
-          else:
-              print("Ответ сайта:", gc.chat("Скажи привет одним коротким предложением.", as_json=False))
-          EOF
-      - name: Upload session file as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: genspark-session
-          path: |
-            genspark_session.json
-            work/genspark/**
-          if-no-files-found: ignore
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: pip
+    - name: Install Python dependencies
+      run: python -m pip install playwright requests 'cryptography>=43'
+    - name: Validate encrypted backup secret
+      run: python runner_state.py validate-key
+    - name: Restore previous encrypted progress
+      run: python runner_state.py restore
+    - name: Install desktop and media tools
+      run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core xvfb x11vnc novnc websockify fluxbox x11-utils
+    - name: Install Chromium
+      run: python -m playwright install --with-deps chromium
+    - name: Connect private Tailscale network
+      uses: tailscale/github-action@v4
+      with:
+        oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+        oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+        tags: tag:ci
+        hostname: ff-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Start private remote desktop
+      run: bash runner_remote.sh
+    - name: Login manually without printing sessions
+      run: python run_job.py login
+    - name: Encrypt progress and sessions
+      if: always()
+      run: python runner_state.py snapshot
+    - name: Upload encrypted checkpoint
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: freefire-state-${{ github.run_id }}-${{ github.run_attempt }}
+        path: state-backup/state.enc
+        if-no-files-found: warn
+        retention-days: 14
+    - name: Save non-secret history and settings
+      if: always()
+      run: bash save_data.sh
+    - name: Close private remote access
+      if: always()
+      run: sudo tailscale serve reset || true
