@@ -14,7 +14,7 @@ DEFAULTS = {
     'GENSPARK_VIDEO_TIMEOUT': '600', 'GENSPARK_MANUAL_WAIT': '600',
     'GENSPARK_HEADLESS': '0', 'GENSPARK_REMOTE': '1', 'GENSPARK_ALLOW_FALLBACK': '0',
     'GENSPARK_ANIM_MODEL': 'Grok lite', 'GENSPARK_ANIM_DURATION': '3',
-    'GENSPARK_ANIM_QUALITY': '480p', 'GENSPARK_VIDEO_MODE': 'manual',
+    'GENSPARK_ANIM_QUALITY': '480p', 'GENSPARK_VIDEO_MODE': 'agent',
     'GENSPARK_FINAL_EDITOR': 'genspark', 'GENSPARK_EDITOR_TIMEOUT': '600',
     'GENSPARK_FINAL_DOWNLOAD_SELECTOR': '',
     'GENSPARK_URL': 'https://www.genspark.ai',
@@ -52,8 +52,8 @@ def validate(key,value):
         raise ValueError('480p или 720p')
     if key == 'GENSPARK_FINAL_EDITOR' and v not in ('genspark','local'):
         raise ValueError('genspark или local')
-    if key == 'GENSPARK_VIDEO_MODE' and v != 'manual':
-        raise ValueError('Пока поддерживается только manual: UI генератора не проверен')
+    if key == 'GENSPARK_VIDEO_MODE' and v not in ('agent','manual'):
+        raise ValueError('agent или manual')
     if key.endswith('_URL'):
         u=urlparse(v)
         if u.scheme != 'https' or u.hostname not in ('genspark.ai','www.genspark.ai') or u.username:
