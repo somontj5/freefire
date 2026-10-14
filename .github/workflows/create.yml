@@ -45,9 +45,9 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: whisper-small-v1
+      - run: pip install -r requirements.txt gradio_client
       - name: Install Playwright Chromium (для сайта genspark.ai)
         run: python -m playwright install --with-deps chromium
-      - run: pip install -r requirements.txt gradio_client
       - name: Create video
         run: python main.py create
         env:
