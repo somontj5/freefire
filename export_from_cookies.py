@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""Собирает storageState из куков genspark.ai и печатает base64 для секрета GENSPARK_STORAGE_N.
-
-Способ для тех, у кого только телефон: куки снимаются в мобильном браузере расширением
-Cookie Editor (Firefox/Chrome на Android), а сам скрипт запускается прямо на GitHub Actions
-(workflow export-session). На компьютере тоже работает.
-
-Куки в файле в любом из форматов:
-  - JSON-массив (экспорт Cookie Editor): [{"name": "...", "value": "...", ...}, ...]
-  - готовый storageState: {"cookies": [...]}
-  - строка: name=value; name2=value2  (домен возьмётся .genspark.ai)
-"""
+"""Optional LOCAL conversion of cookie export; secrets are saved to a private file, never printed.\nSupports JSON storageState, Cookie Editor JSON and Netscape cookies.\nFor phone users prefer manual server login in export-session."""
 import argparse
 import base64
 import json
@@ -53,9 +43,11 @@ def netscape_cookies(text):
     out = []
     for line in text.replace("\r", "").split("\n"):
         line = line.strip()
-        if not line or line.startswith("#") or "\t" not in line:
+        httponly=line.startswith('#HttpOnly_')
+        if httponly:line=line[len('#HttpOnly_'):]
+        if not line or line.startswith('#') or '\t' not in line:
             continue
-        f = line.split("\t")
+        f = line.split("\t",6)
         if len(f) < 7 or not f[5].strip():
             continue
         domain, _flag, path, secure, exp, name, value = f[:7]
@@ -66,7 +58,7 @@ def netscape_cookies(text):
         out.append({"name": name.strip(), "value": value.strip(),
                     "domain": domain.strip() or DEFAULT_DOMAIN,
                     "path": path.strip() or "/", "expires": expires,
-                    "httpOnly": False, "secure": secure.strip().upper() == "TRUE",
+                    "httpOnly": httponly, "secure": secure.strip().upper() == "TRUE",
                     "sameSite": "Lax"})
     return out
 
@@ -87,7 +79,7 @@ def parse_cookies(text):
     if not text:
         sys.exit("Файл с куками пуст")
     # формат Netscape (кнопка «Export»): табы между полями - разбираем сразу, до попытки JSON
-    if "\t" in text and "{" not in text[:200]:
+    if "\t" in text and not text.lstrip().startswith(("{", "[")):
         ns = netscape_cookies(text)
         if ns:
             return ns
@@ -127,35 +119,18 @@ def verify(state):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("cookies_file", help="файл с куками (JSON Cookie Editor или строки name=value)")
-    ap.add_argument("-o", "--out", default="genspark_session.json", help="куда сохранить storageState")
-    ap.add_argument("--verify", action="store_true", help="проверить сессию на настоящем genspark.ai")
-    args = ap.parse_args()
-
-    cs = parse_cookies(pathlib.Path(args.cookies_file).read_text(encoding="utf-8", errors="ignore"))
-    state = {"cookies": cs, "origins": []}
-    pathlib.Path(args.out).write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    b64 = base64.b64encode(json.dumps(state, ensure_ascii=False).encode()).decode()
-
-    print(f"куков собрано: {len(cs)}: " + ", ".join(c["name"] for c in cs[:12]) +
-          (" ..." if len(cs) > 12 else ""))
-    print(f"storageState сохранён в файл: {args.out}\n")
-    print("=== НАЧАЛО base64 (скопируй весь блок целиком в секрет GENSPARK_STORAGE_N) ===")
-    for i in range(0, len(b64), 100):
-        print(b64[i:i + 100])
-    print("=== КОНЕЦ base64 ===")
-
-    if not args.verify:
-        return 0
-    try:
-        ok = verify(state)
-        print("Проверка на сайте:", "СЕССИЯ РАБОТАЕТ - форма входа не показывается"
-              if ok else "СЕССИЯ НЕ ПОДТВЕРЖДЕНА - сайт показывает вход, обнови куки")
-        return 0 if ok else 1
-    except Exception as e:  # noqa
-        print(f"Проверка не удалась: {str(e)[:200]}")
-        return 1
+    ap=argparse.ArgumentParser(description='Локальное преобразование; не печатает секреты')
+    ap.add_argument('cookies_file')
+    ap.add_argument('-o','--out',default='private-runtime/sessions/account-1.json')
+    args=ap.parse_args()
+    import os
+    import genspark_client as gc
+    raw=pathlib.Path(args.cookies_file).read_text(encoding='utf8')
+    st=gc._clean({'cookies':parse_cookies(raw),'origins':[]})
+    target=pathlib.Path(args.out);target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    target.write_text(json.dumps(st),encoding='utf8');os.chmod(target,0o600)
+    print('Файл сессии сохранён локально. Значения в лог не выводятся.')
+    return 0
 
 
 if __name__ == "__main__":
