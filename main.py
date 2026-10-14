@@ -53,9 +53,13 @@ BEAT_SYNC = (ENV("BEAT_SYNC") or "1") != "0"           # смена кадров
 MUSIC_VOL = float(ENV("MUSIC_VOL") or 0.45)            # громкость музыки относительно голоса (дорожка уже выровнена по громкости)
 MUSIC_MODE = (ENV("MUSIC_MODE") or "mood").lower()     # mood: музыка по настроению сцен, single: один фон на весь ролик
 TIME_BUDGET_MIN = float(ENV("TIME_BUDGET_MIN") or 35)  # после этого тяжёлые эффекты (параллакс) отключаются, чтобы успеть до тайм-аута
+# Оживление кадров: сайт genspark.ai превращает картинку сцены в видео (по заметкам: «генспарк получает фото
+# и промты и генерирует видео»). ANIMATE=0 вернёт прежний монтаж статичными кадрами с камерой.
+ANIMATE_ON = (ENV("ANIMATE") or "1") != "0"
+MAX_ANIMATE = int(ENV("MAX_ANIMATE") or 6)             # сколько сцен за ролик оживляем (остальные - монтаж кадром)
 HF_DEAD_HOURS = float(ENV("HF_DEAD_HOURS") or 8)       # сколько часов не трогать токен, у которого кончилась квота
 TOKENS_FILE = ROOT / "data" / "hf_tokens.json"
-RUN = {"t0": time.time(), "fx_fail": 0, "lint": 0, "music": ""}     # счётчики для итогового отчёта
+RUN = {"t0": time.time(), "fx_fail": 0, "lint": 0, "music": "", "anim": 0, "anim_fail": 0}     # счётчики для итогового отчёта
 TG_TOKEN = ENV("TG_TOKEN", "")
 TG_CHAT = ENV("TG_CHAT_ID", "")
 IG_USER = ENV("IG_USER_ID", "")
@@ -104,6 +108,11 @@ TTS_PROVIDER = (ENV("TTS_PROVIDER") or "auto").lower()
 PUTER_TOKEN = ENV("PUTER_AUTH_TOKEN", "")
 CLAUDE_MODEL = ENV("CLAUDE_MODEL") or "claude-sonnet-4-6"
 SCRIPT_WRITER = (ENV("SCRIPT_WRITER") or "auto").lower()
+# Сайт genspark.ai вместо API (браузер Playwright). Аккаунты БЕЗ ОГРАНИЧЕНИЯ по количеству:
+# секреты GENSPARK_STORAGES (один JSON-массив) и/или GENSPARK_STORAGE_1..N (сканируются без предела);
+# GENSPARK_ACCOUNTS (по умолчанию 1) задаёт, сколько найденных в ротации, "all" = все.
+# См. export_session.py и README. GENSPARK_FIRST=1 по умолчанию: сначала сайт, при сбое - обычные пути.
+GENSPARK_FIRST = (ENV("GENSPARK_FIRST") or "1").lower() in ("1", "true", "yes")
 GEMINI_VOICE = ENV("GEMINI_VOICE") or "Charon"
 GEMINI_TTS_MODELS = list(dict.fromkeys(m for m in [ENV("GEMINI_TTS_MODEL"), "gemini-3.8-flash-lite-tts",
                                                    "gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview",
@@ -200,6 +209,161 @@ def get_video(vid):
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
 
 
+# ───────── настройки: меняются ботом, хранятся в data/settings.json (коммитится «Save data») ─────────
+# Файл перекрывает переменные репозитория только по этим ключам; остальное живёт в GitHub Variables.
+SETTINGS_FILE = ROOT / "data" / "settings.json"
+SETTINGS_KEYS = {"ANIMATE", "MAX_ANIMATE", "GENSPARK_ANIM_MODEL", "GENSPARK_ANIM_DURATION",
+                 "GENSPARK_ANIM_QUALITY", "GENSPARK_VIDEO_TIMEOUT", "GENSPARK_VIDEO_URL"}
+
+
+def load_settings():
+    try:
+        d = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa
+        return {}
+
+
+def save_setting(key, value):
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    d = load_settings()
+    d[key] = str(value)
+    tmp = SETTINGS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, SETTINGS_FILE)
+
+
+def _apply_settings():
+    """Перекрывает окружение и константы файла настроек (до старта сборки)."""
+    for k, v in load_settings().items():
+        if k not in SETTINGS_KEYS:
+            continue
+        os.environ[k] = str(v)
+        if k == "ANIMATE":
+            globals()["ANIMATE_ON"] = str(v).lower() in ("1", "true", "yes")
+        elif k == "MAX_ANIMATE":
+            try:
+                globals()["MAX_ANIMATE"] = int(v)
+            except ValueError:  # noqa
+                pass
+
+
+def settings_text():
+    d = load_settings()
+    on = d.get("ANIMATE", "1" if ANIMATE_ON else "0")
+    rows = ["⚙️ Настройки оживления",
+            f"анимация: {'вкл' if on.lower() in ('1', 'true', 'yes') else 'выкл'}",
+            f"оживляемых сцен за ролик: {d.get('MAX_ANIMATE', str(MAX_ANIMATE))}",
+            f"модель: {d.get('GENSPARK_ANIM_MODEL', 'Grok lite (по умолчанию)')}",
+            f"длительность: {d.get('GENSPARK_ANIM_DURATION', '3')} с",
+            f"качество: {d.get('GENSPARK_ANIM_QUALITY', '480p')}",
+            "",
+            "Менять: /анимация вкл|выкл · /сцен N · /длительность 3-10 · /качество 480p|720p · /модель название",
+            "Применится к следующему ролику."]
+    return "\n".join(rows)
+
+
+# ───────────── чекпоинты: прогресс сохраняется между аккаунтами и запусками ─────────────
+# Каждый готовый артефакт (сценарий, кадр, голос, ожившее видео) сразу пишется в data/jobs/<id>/
+# и коммитится шагом «Save data». Когда у аккаунтов genspark.ai кончаются лимиты, job встаёт на паузу,
+# а следующий запуск (по расписанию или /make) продолжает с того же места другим аккаунтом:
+# готовое не перегенерируется и квоту не тратит. Пароли и куки в state.json не пишутся никогда.
+
+JOBS = ROOT / "data" / "jobs"
+CK = {"vid": None, "scenes": {}}
+MIN_SIZE = (("img", ".png", 5000), ("voice", ".mp3", 8000), ("anim", ".mp4", 20000))
+
+
+class QuotaPause(RuntimeError):
+    """Все аккаунты genspark.ai исчерпали лимиты. Прогресс сохранён, job ждёт следующего запуска."""
+
+
+def _solid(p, min_size):
+    try:
+        return p.exists() and p.stat().st_size >= min_size
+    except Exception:  # noqa
+        return False
+
+
+def _atomic_json(path, data):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def ck_load(vid):
+    try:
+        return json.loads((JOBS / vid / "state.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa
+        return None
+
+
+def ck_put(vid, i=None, story=None, facts=None, sources=None, claims=None, status=None,
+           img=None, voice=None, anim=None):
+    """Атомарно обновляет state.json и копирует артефакты сцены в job-папку.
+    Артефакт считается готовым только если файл существует и не пустой."""
+    d = JOBS / vid
+    d.mkdir(parents=True, exist_ok=True)
+    if i is not None:
+        sc = CK["scenes"].setdefault(str(i), {})
+        for key, ext, mn in MIN_SIZE:
+            src = {"img": img, "voice": voice, "anim": anim}[key]
+            if src is not None and _solid(pathlib.Path(src), mn):
+                shutil.copy(src, d / f"s{i:02d}_{key}{ext}")
+                sc[key] = True
+        if sc.get("img") and sc.get("voice"):   # кадр и голос готовы: сцену больше не генерируем
+            sc["done"] = True
+    if story is not None:
+        (d / "story.json").write_text(json.dumps(story, ensure_ascii=False), encoding="utf-8")
+    _atomic_json(d / "state.json", {"id": vid, "status": status or "running", "updated": now_iso(),
+                                    "facts": (facts or "")[:6000], "sources": sources or [],
+                                    "claim_issues": claims or [], "lint": RUN["lint"], "scenes": CK["scenes"]})
+
+
+def ck_done(vid):
+    """Ролик доделан: тяжёлые артефакты из job-папки удаляем (всё уже в релизе и Telegram),
+    остаётся только итоговый state.json."""
+    d = JOBS / vid
+    if not d.exists():
+        return
+    for p in d.iterdir():
+        if p.name != "state.json":
+            p.unlink()
+    st = ck_load(vid) or {}
+    st.update({"status": "done", "updated": now_iso()})
+    _atomic_json(d / "state.json", st)
+
+
+def ck_artifact(vid, i, key):
+    ext = dict((k, e) for k, e, _ in MIN_SIZE)[key]
+    p = JOBS / vid / f"s{i:02d}_{key}{ext}"
+    return p if p.exists() else None
+
+
+def pick_resume():
+    """Какой job продолжать. RESUME=<id> или --resume <id> - конкретный; RESUME=new - всегда новый;
+    пусто (по умолчанию) - продолжить последний недоделанный (на паузе), если он есть."""
+    r = (ENV("RESUME") or "").strip()
+    if "--resume" in sys.argv:
+        try:
+            r = sys.argv[sys.argv.index("--resume") + 1]
+        except IndexError:  # noqa
+            sys.exit("после --resume укажи id job-а, например: python main.py create --resume 20261014-080000")
+    if r.lower() in ("new", "0", "off", "none"):
+        return None
+    if OFFLINE and not r:      # в офлайн-тесте автопродолжения нет, явный RESUME работает
+        return None
+    if r:
+        return r if ck_load(r) else (log(f"job {r} не найден, делаю новый"), None)[1]
+    cands = []
+    if JOBS.exists():
+        for d in JOBS.iterdir():
+            st = ck_load(d.name)
+            if st and st.get("status") == "paused":
+                cands.append((st.get("updated", ""), d.name))
+    return max(cands)[1] if cands else None
+
+
 # ───────────────────────── Telegram ─────────────────────────
 
 def tg(method, files=None, **params):
@@ -293,7 +457,34 @@ def parse_json_loose(text):
     return json.loads(text[a:b + 1])
 
 
-def claude_json(prompt):
+def genspark_search(prompt):
+    """Поиск фактов через сайт genspark.ai (браузер без API). None - аккаунты не настроены.
+    RuntimeError - сайт не ответил: вызывающий код вернётся к поиску Google в Gemini."""
+    import genspark_client
+    if not genspark_client.accounts():
+        return None
+    try:
+        return genspark_client.chat(prompt, as_json=False, search=True)
+    except Exception as e:  # noqa
+        raise RuntimeError(str(e))
+
+
+def smart_json(prompt, models=None):
+    """JSON-ответ: сначала сайт genspark.ai (если аккаунты заданы), иначе Gemini API.
+    Сбой сайта не роняет запуск - просто идём на запасной путь."""
+    if GENSPARK_FIRST:
+        import genspark_client
+        if genspark_client.accounts():
+            try:
+                out = genspark_client.chat(prompt, as_json=True)
+                if out is not None:
+                    return out
+            except Exception as e:  # noqa
+                log("genspark.ai не ответил, ответ через Gemini:", str(e)[:160])
+    return gemini(prompt, models=models)
+
+
+def _claude_json_puter(prompt):
     """Сценарий от Claude. Puter даёт OpenAI-совместимый адрес, токен берётся на puter.com/dashboard."""
     last = None
     for attempt in range(2):
@@ -1133,6 +1324,8 @@ def validate_story(s):
             sc["sfx"] = "none"
         if not sc.get("prop") or sc["prop_motion"] == "none":
             sc["prop"], sc["prop_motion"] = None, "none"
+        mp = str(sc.get("motion_prompt") or "").strip()          # промт оживления (для сайта genspark.ai)
+        sc["motion_prompt"] = re.sub(r"[^\w ,.-]", "", mp[:200]) if mp else ""
     return s
 
 
@@ -1562,6 +1755,8 @@ def validate_story_script(s):
         acc = sc.get("accent") or []
         sc["accent"] = [norm_word(a) for a in acc if isinstance(a, str) and a.strip()][:3]
         sc["flashback"] = bool(sc.get("flashback"))
+        mp = str(sc.get("motion_prompt") or "").strip()      # промт оживления (для сайта genspark.ai)
+        sc["motion_prompt"] = re.sub(r"[^\w ,.-]", "", mp[:200]) if mp else ""
         card = sc.get("card")
         if isinstance(card, dict) and card.get("lines"):
             lines = [str(x).upper()[:28] for x in card["lines"][:3]]
@@ -1695,7 +1890,7 @@ def lint_narration(story):
          "действие из этой же фразы. Новых фактов не добавляй. Слов должно быть примерно столько же.\n\n"
          f"ФРАЗЫ:\n{lines}\n\nВерни ТОЛЬКО JSON: {{\"fixed\": {{\"номер\": \"новый текст\"}}}}")
     try:
-        out = gemini(p, models=GEMINI_SCRIPT_MODELS)
+        out = smart_json(p, models=GEMINI_SCRIPT_MODELS)
         fixed = out.get("fixed") or {}
     except Exception as e:  # noqa
         log("чистка штампов пропущена:", str(e)[:100])
@@ -1727,7 +1922,7 @@ def check_claims(story, facts):
          f"ФАКТЫ:\n{facts[:7000]}\n\nОЗВУЧКА:\n{narr}\n\n"
          "Верни ТОЛЬКО JSON: {\"issues\": [{\"scene\": 3, \"claim\": \"что утверждается\", \"why\": \"почему не подтверждается\"}]}")
     try:
-        out = gemini(p)
+        out = smart_json(p)
         issues = [x for x in (out.get("issues") or []) if isinstance(x, dict) and x.get("claim")]
     except Exception as e:  # noqa
         log("проверка фактов пропущена:", str(e)[:100])
@@ -1757,6 +1952,9 @@ def run_report(story, photos, parallax, redraws, img_fail, beat, claims):
         parts.append(f"сцен с упрощённым монтажом {RUN['fx_fail']}")
     if claims:
         parts.append(f"фактов под вопросом {len(claims)}")
+    anim_total = sum(1 for s in CK["scenes"].values() if s.get("anim"))   # считая восстановленные из чекпоинта
+    if anim_total:
+        parts.append(f"оживших сцен {anim_total}")
     return "📊 " + "; ".join(parts)
 
 
@@ -1772,6 +1970,17 @@ def render_clip_safe(tag, sc, img, d, voice, plan, prev_img, cut):
         return render_clip_basic(tag, sc, img, d, voice)
 
 
+def animate_prompt(sc, d=None):
+    """Промт оживления сцены для сайта: готовый от сценариста (motion_prompt) или из описания кадра.
+    Чистим даже в обход validate_story: только буквы, цифры и простая пунктуация."""
+    base = (sc.get("motion_prompt") or "").strip()
+    if not base:
+        base = re.sub(r"\[[^\]]+\]", "", sc.get("image_prompt", "")).strip()
+    base = re.sub(r"[^\w ,.-]", "", base[:200]).strip() or "смена кадра"
+    # длительность, модель и качество сайт-клиент подставляет сам (GENSPARK_ANIM_DURATION/MODEL/QUALITY)
+    return f"{base}. Плавное кинематографичное движение, живая мимика и жесты персонажей, без текста в кадре".strip()
+
+
 def rewrite_image_prompts(story, cast):
     """Второй вызов: отдельный «арт-директор» пишет промпты картинок по готовым фразам, плюс выбирает якорные
     сцены для реальных фото. Если не вышло, остаются промпты из сценария (после чистки запрещённых слов)."""
@@ -1783,7 +1992,7 @@ def rewrite_image_prompts(story, cast):
          .replace("<<CAST>>", names).replace("<<N>>", str(len(scenes))).replace("<<MAXPHOTOS>>", str(MAX_PHOTOS)))
     lst, photos = None, []
     try:
-        out = gemini(p, models=GEMINI_SCRIPT_MODELS)
+        out = smart_json(p, models=GEMINI_SCRIPT_MODELS)
         lst = out.get("prompts") if isinstance(out, dict) else out
         if not isinstance(lst, list) or len(lst) != len(scenes) or not all(isinstance(x, str) and len(x) > 15 for x in lst):
             raise ValueError(f"промптов {len(lst) if isinstance(lst, list) else '?'} вместо {len(scenes)}")
@@ -2130,6 +2339,51 @@ def _fx():
     fx.init(W=W, H=H, FPS=FPS, OVERLAP=OVERLAP, FONT=FONT, RED=RED, WORK=WORK, text_w=text_w, log=log, run=run, PIXEL=PIXEL_ART,
             ROOT=ROOT, MUSIC_CACHE=pathlib.Path.home() / ".cache" / "freefire_music")
     return fx
+
+
+def render_clip_video(tag, sc, video, d, voice=None):
+    """Сцена из готового ожившего видео (сайт genspark.ai): подгонка под длительность фразы
+    (короткий ролик зацикливается, длинный обрезается), поверх - слова-субтитры и карточка."""
+    total = d + OVERLAP
+    out = WORK / f"{tag}_clip.mp4"
+    vf = [f"scale=2160:3840:force_original_aspect_ratio=increase,crop={W}:{H}"]
+    for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []), voice)):
+        f = WORK / f"{tag}_w{i}.txt"
+        f.write_text(w, encoding="utf-8")
+        vf.append(_drawtext(f, fit_size(w, 66, W * 0.94 / 1.35, 34), RED if hot else "white",
+                            "h*0.63-text_h/2", f"between(t,{a:.2f},{b:.2f})", pop_at=a))
+    card = sc.get("card")
+    if card:
+        y = int(H * 0.09)
+        for i, (line, size, is_red) in enumerate(card_layout(card["lines"], card["red"])):
+            f = WORK / f"{tag}_c{i}.txt"
+            f.write_text(line, encoding="utf-8")
+            vf.append(_drawtext(f, size, RED if is_red else "white", str(y), "gte(t,0)", 6))
+            y += int(size * 1.22)
+    run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(video), "-vf", ",".join(vf) + ",format=yuv420p",
+         "-t", f"{total:.2f}", "-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+         "-an", str(out)])
+    return out
+
+
+def animate_scene(i, sc, img, voice, tag):
+    """Оживление сцены: сайт genspark.ai получает фото и промт движения и генерирует видео.
+    Промт движения приходит от сценариста (motion_prompt). Голос диктора нужен, чтобы ролик
+    сайта был не короче фразы. Возвращает путь mp4, None (останется статичный кадр)
+    или бросает QuotaPause - аккаунты/лимиты исчерпаны, job встаёт на паузу."""
+    import genspark_client
+    if not genspark_client.accounts():
+        log("аккаунты genspark.ai не настроены - сцена остаётся статичным кадром")
+        return None
+    try:
+        d = duration(voice)
+    except Exception:  # noqa
+        d = 5.0
+    out = WORK / f"{tag}_anim.mp4"
+    try:
+        return genspark_client.animate(img, animate_prompt(sc, d), out)
+    except Exception as e:  # noqa
+        raise QuotaPause(f"оживление сцены {i + 1}: {e}") from None
 
 
 def render_clip(tag, sc, img, d, voice=None, plan=None, prev_img=None, cut=None):
@@ -2599,13 +2853,22 @@ def research(videos):
                 log("Tavily недоступен:", e)
                 notify(f"ℹ️ Tavily недоступен ({str(e)[:200]}). Пробую другой поиск.")
         if not pages and use_search:
+            prompt_r = (prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", label)
+                        .replace("<<HISTORY>>", hist).replace("<<PEOPLE>>", people_txt))
             try:
-                text, srcs = gemini_search(prompts.RESEARCH_PROMPT.replace("<<FOCUS>>", label)
-                                           .replace("<<HISTORY>>", hist).replace("<<PEOPLE>>", people_txt))
+                text = genspark_search(prompt_r)          # сначала сайт genspark.ai, если аккаунты заданы
+                if text:
+                    srcs = []                             # ссылки сайт кладёт прямо в текст ответа
             except RuntimeError as e:
-                use_search = False
-                log("поиск Google недоступен:", e)
-                notify(f"ℹ️ Поиск Google в Gemini недоступен ({str(e)[:200]}). Беру факты из Википедии.")
+                text = None
+                log("продолжаю через поиск Google в Gemini:", str(e)[:120])
+            if text is None:
+                try:
+                    text, srcs = gemini_search(prompt_r)
+                except RuntimeError as e:
+                    use_search = False
+                    log("поиск Google недоступен:", e)
+                    notify(f"ℹ️ Поиск Google в Gemini недоступен ({str(e)[:200]}). Беру факты из Википедии.")
         if text is None:
             if not pages:
                 pages = wiki_sources(focus if custom else None)
@@ -2631,28 +2894,43 @@ def research(videos):
                   "или задай тему сам: /тема имя или ник игрока.")
 
 
-def build_script_prompt(facts, cast, writer="gemini"):
+def build_script_prompt(facts, cast):
     import prompts
     heroes = "\n".join(f"- {c['name']}: {c['description']}" for c in cast.values()) or "- пока нет"
     tpl = prompts.SCRIPT_PROMPT_STORY if MODE == "story" else prompts.SCRIPT_PROMPT
-    if writer == "claude" and MODE == "story":
+    if PUTER_TOKEN and SCRIPT_WRITER in ("auto", "claude") and MODE == "story":
         tpl = prompts.SCRIPT_PROMPT_CLAUDE
     return tpl.replace("<<FACTS>>", facts).replace("<<HEROES>>", heroes)
 
 
 def cmd_create():
     WORK.mkdir(exist_ok=True)
-    vid = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-    RUN.update(t0=time.time(), fx_fail=0, lint=0, music="")
+    vid = pick_resume() or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    RUN.update(t0=time.time(), fx_fail=0, lint=0, music="", anim=0, anim_fail=0)
+    if set(load_settings()) & SETTINGS_KEYS:
+        _apply_settings()
+        log("применены настройки из data/settings.json: " +
+            ", ".join(f"{k}={v}" for k, v in sorted(load_settings().items())))
     claim_issues = []
+    story, facts, sources = None, "", []
+    rstate = ck_load(vid) if (JOBS / vid / "state.json").exists() else None
+    CK.update(vid=vid, scenes=(rstate or {}).get("scenes") or {})
     try:
         refresh_stats()
         videos = load_videos()
         cast = load_cast()
         story_mode = MODE == "story"
         photo = MODE in ("photo", "story")
-        facts, sources = "", []
-        if OFFLINE:
+        if rstate and (JOBS / vid / "story.json").exists():
+            # продолжение: сценарий, промпты и готовые сцены берём из чекпоинта, поиск и сценариста не дёргаем
+            story = json.loads((JOBS / vid / "story.json").read_text(encoding="utf-8"))
+            facts = rstate.get("facts") or ""
+            sources = rstate.get("sources") or []
+            claim_issues = rstate.get("claim_issues") or []
+            RUN["lint"] = rstate.get("lint") or 0
+            done_n = sum(1 for s in CK["scenes"].values() if s.get("done"))
+            log(f"возобновляю job {vid}: сценарий из чекпоинта, готово сцен {done_n}/{len(story.get('scenes', []))}")
+        elif OFFLINE:
             story = SAMPLE_STORY_SHORTS if story_mode else (SAMPLE_STORY_PHOTO if photo else SAMPLE_STORY)
         elif photo and (STORY_TYPE == "real" or SCRIPT_TEXT):
             if SCRIPT_TEXT:
@@ -2664,17 +2942,18 @@ def cmd_create():
             story = None
             if PUTER_TOKEN and SCRIPT_WRITER in ("auto", "claude") and story_mode and not SCRIPT_TEXT:
                 try:
-                    story = claude_json(build_script_prompt(facts, cast, "claude"))
+                    story = _claude_json_puter(build_script_prompt(facts, cast))
                     log(f"сценарий написал Claude ({CLAUDE_MODEL})")
                 except Exception as e:  # noqa
                     (log if "402" in str(e) else notify)(f"ℹ️ Claude недоступен ({str(e)[:200]}). Сценарий пишет Gemini.")
             if story is None:
-                story = gemini(build_script_prompt(facts, cast), models=GEMINI_SCRIPT_MODELS)
+                story = smart_json(build_script_prompt(facts, cast), models=GEMINI_SCRIPT_MODELS)
         else:
             story = gemini((story_prompt_photo if photo else story_prompt)(videos, cast))
-        story = (validate_story_script(story) if story_mode else
-                 validate_photo_story(story) if photo else validate_story(story))
-        if story_mode and not OFFLINE and not SCRIPT_TEXT:
+        if not rstate:
+            story = (validate_story_script(story) if story_mode else
+                     validate_photo_story(story) if photo else validate_story(story))
+        if story_mode and not OFFLINE and not SCRIPT_TEXT and not rstate:
             RUN["lint"] = lint_narration(story)
             if facts:
                 claim_issues = check_claims(story, facts)
@@ -2682,8 +2961,10 @@ def cmd_create():
         for c in story.get("cast") or []:
             ensure_character(c["name"], c["description"], cast, portrait=not photo,
                              ref=photo and CHAR_REF, face=story_mode and INSTANTID)
-        if story_mode and not OFFLINE:
+        if story_mode and not OFFLINE and not rstate:
             rewrite_image_prompts(story, cast)
+        if not rstate:      # чекпоинт сценария: на продолжении промпты и поиск заново не повторяются
+            ck_put(vid, story=story, facts=facts, sources=sources, claims=claim_issues)
         if not photo:
             for c in list(cast.values()):
                 ensure_character(c["name"], c["description"], cast, portrait=True)
@@ -2710,12 +2991,18 @@ def cmd_create():
                 beat = (mus["bpm"], mus["offset"])
                 log(f"темп музыки {mus['bpm']} уд/мин, смены кадров подгоняются под ритм")
         last_img, img_fail, recent, photos_used, redraws = None, 0, [], 0, 0
+        anims_done = sum(1 for s in CK["scenes"].values() if s.get("anim"))   # уже оживлены ранее (учёт лимита)
         for i, sc in enumerate(story["scenes"]):
             tag = f"s{i:02d}"
             log(f"сцена {i + 1}/{len(story['scenes'])}: {sc['narration']}")
             seed = random.Random(f"{vid}{i}").randint(1, 10_000_000)
             if story_mode:
                 img = WORK / f"{tag}_img.png"
+                # восстановление сцены из чекпоинта: если она уже доснята другим аккаунтом/запуском,
+                # дорогая генерация не повторяется - берём готовые артефакты из job-папки
+                st_sc = CK["scenes"].get(str(i)) or {}
+                saved_img, saved_voice = ck_artifact(vid, i, "img"), ck_artifact(vid, i, "voice")
+                restored = bool(st_sc.get("done") and saved_img and saved_voice)
                 refs = ref_urls(sc["image_prompt"], cast, have_ref) if (CHAR_REF and IMAGE_PROVIDER == "pollinations") else []
                 extra = ", the characters look exactly like in the reference images" if refs else ""
                 init_ref = None
@@ -2733,51 +3020,57 @@ def cmd_create():
                             face = c0["dir"] / "face.png"
                             break
                 used_photo = False
-                if PHOTOS_ON and sc.get("photo_query") and photos_used < MAX_PHOTOS and not OFFLINE:
+                if restored:
+                    shutil.copy(saved_img, img)      # копия в WORK нужна соседним сценам (параллакс, замена)
+                    log(f"сцена {i + 1}: уже готова из чекпоинта, генерация пропущена")
+                else:
+                    if PHOTOS_ON and sc.get("photo_query") and photos_used < MAX_PHOTOS and not OFFLINE:
+                        try:
+                            credit = real_photo(sc, img)
+                        except Exception as e:  # noqa
+                            credit = None
+                            log("реальное фото не вышло:", str(e)[:120])
+                        if credit:
+                            used_photo = True
+                            photos_used += 1
+                            sources.append(credit)
+                            log(f"сцена {i + 1}: реальное фото ({sc['photo_query']})")
+                    base_prompt = expand_prompt(sc["image_prompt"], cast) + extra + ", no text, no letters, no watermark"
                     try:
-                        credit = real_photo(sc, img)
-                    except Exception as e:  # noqa
-                        credit = None
-                        log("реальное фото не вышло:", str(e)[:120])
-                    if credit:
-                        used_photo = True
-                        photos_used += 1
-                        sources.append(credit)
-                        log(f"сцена {i + 1}: реальное фото ({sc['photo_query']})")
-                base_prompt = expand_prompt(sc["image_prompt"], cast) + extra + ", no text, no letters, no watermark"
-                try:
-                    if not used_photo:
-                        gen_image("vscene", base_prompt, img, seed, refs or None, face=face, init=init_ref,
-                                  strength=min(0.95, IMG2IMG_STRENGTH + (-0.05, 0.0, 0.05)[i % 3]))
-                        if redraws < MAX_REDRAWS and is_repeat(img, recent):
-                            redraws += 1
-                            log(f"кадр {i + 1} похож на предыдущие, рисую заново в другом ракурсе")
-                            try:
-                                gen_image("vscene", base_prompt + ", " + SHOTS[i % len(SHOTS)], img, seed + 7919,
-                                          refs or None, face=face, init=init_ref, strength=0.93)
-                            except RuntimeError:
-                                pass        # оставляем первый вариант
-                        prob = frame_problem(img) if redraws < MAX_REDRAWS else None
-                        if prob:
-                            redraws += 1
-                            log(f"кадр {i + 1}: {prob}, рисую заново без устройств")
-                            try:
-                                gen_image("vscene", strip_devices(base_prompt) + ", wide cinematic shot of people and landscape",
-                                          img, seed + 4241, refs or None, face=face, init=init_ref, strength=0.9)
-                            except RuntimeError:
-                                pass
-                except RuntimeError as e:
-                    if last_img is None or img_fail > max(4, int(len(story["scenes"]) * 0.4)):
-                        raise
-                    img_fail += 1
-                    log(f"картинка сцены {i + 1} не получилась, беру предыдущую: {str(e)[:120]}")
-                    shutil.copy(last_img, img)
+                        if not used_photo:
+                            gen_image("vscene", base_prompt, img, seed, refs or None, face=face, init=init_ref,
+                                      strength=min(0.95, IMG2IMG_STRENGTH + (-0.05, 0.0, 0.05)[i % 3]))
+                            if redraws < MAX_REDRAWS and is_repeat(img, recent):
+                                redraws += 1
+                                log(f"кадр {i + 1} похож на предыдущие, рисую заново в другом ракурсе")
+                                try:
+                                    gen_image("vscene", base_prompt + ", " + SHOTS[i % len(SHOTS)], img, seed + 7919,
+                                              refs or None, face=face, init=init_ref, strength=0.93)
+                                except RuntimeError:
+                                    pass        # оставляем первый вариант
+                            prob = frame_problem(img) if redraws < MAX_REDRAWS else None
+                            if prob:
+                                redraws += 1
+                                log(f"кадр {i + 1}: {prob}, рисую заново без устройств")
+                                try:
+                                    gen_image("vscene", strip_devices(base_prompt) + ", wide cinematic shot of people and landscape",
+                                              img, seed + 4241, refs or None, face=face, init=init_ref, strength=0.9)
+                                except RuntimeError:
+                                    pass
+                    except RuntimeError as e:
+                        if last_img is None or img_fail > max(4, int(len(story["scenes"]) * 0.4)):
+                            raise
+                        img_fail += 1
+                        log(f"картинка сцены {i + 1} не получилась, беру предыдущую: {str(e)[:120]}")
+                        shutil.copy(last_img, img)
                 last_img = img
                 try:
                     recent = (recent + [ahash(img)])[-6:]
                 except Exception:  # noqa
                     pass
-                if voices:
+                if restored:
+                    voice = saved_voice              # озвучка этой фразы уже готова
+                elif voices:
                     voice = voices[i]
                 else:
                     voice = WORK / f"{tag}.mp3"
@@ -2800,9 +3093,39 @@ def cmd_create():
                         parallax_used += 1
                         plans[i]["parallax"] = True
                 prev_img = (WORK / f"s{i - 1:02d}_img.png") if i > 0 else None
-                clips.append(render_clip_safe(tag, sc, img, d, voice, plans[i] if plans else None, prev_img, cut))
+                # Оживление кадра на сайте genspark.ai (по заметкам: фото + промт движения -> видео).
+                # Дорогая генерация только на выбранных сценах; лимиты кончились - job встаёт на паузу
+                # с сохранением прогресса, другой сбой - сцена монтируется статичным кадром.
+                anim = None
+                if restored:
+                    anim = ck_artifact(vid, i, "anim")   # готовое видео из чекпоинта, квота не тратится
+                    if anim:
+                        anims_done += 1
+                # кадр и голос восстановлены, но оживления нет: его доснимает другой аккаунт
+                if anim is None and (story_mode and ANIMATE_ON and not used_photo and anims_done < MAX_ANIMATE
+                        and not OFFLINE and not over_budget()):
+                    try:
+                        anim = animate_scene(i, sc, img, voice, tag)
+                    except QuotaPause:
+                        # кадр и голос этой сцены уже готовы - сохранить, чтобы другой аккаунт
+                        # не рисовал их заново, а только оживил; дальше - пауза до следующего запуска
+                        ck_put(vid, i=i, img=img, voice=voice)
+                        raise
+                    except Exception as e:  # noqa
+                        RUN["anim_fail"] += 1
+                        log(f"оживление сцены {i + 1} не вышло, монтирую статичным кадром: {str(e)[:120]}")
+                    else:
+                        RUN["anim"] += 1
+                if anim:
+                    clips.append(render_clip_video(tag, sc, anim, d, voice))
+                else:
+                    clips.append(render_clip_safe(tag, sc, img, d, voice, plans[i] if plans else None, prev_img, cut))
                 audios.append(scene_audio(tag, sc, voice, d))
                 durs.append(d)
+                if not restored:      # сцена целиком готова: кадр, голос, видео -> сразу в чекпоинт
+                    ck_put(vid, i=i, img=img, voice=voice, anim=anim)
+                    if anim:
+                        anims_done += 1
                 continue
             if photo:
                 img = WORK / f"{tag}_img.png"
@@ -2864,6 +3187,15 @@ def cmd_create():
     except NoStory as e:
         notify(f"🔎 {e}")
         return
+    except QuotaPause as e:
+        # Лимиты всех задействованных аккаунтов genspark.ai исчерпаны. Всё доснятое уже лежит
+        # в data/jobs/<id>/ и уйдёт в git шагом «Save data»; следующий запуск продолжит сам.
+        ck_put(vid, story=story, facts=facts, sources=sources, claims=claim_issues, status="paused")
+        done_n = sum(1 for s in CK["scenes"].values() if s.get("done"))
+        log("job встал на паузу до следующего запуска")
+        notify(f"⏸ Лимиты genspark.ai исчерпаны ({str(e)[:140]}). Прогресс сохранён: сценарий и {done_n} готовых сцен. "
+               f"Следующий запуск (по расписанию или /make) продолжит job {vid} с места остановки - уже другой аккаунт.")
+        return
     except Exception as e:
         notify(f"❌ Не удалось собрать ролик: {e}")
         raise
@@ -2904,6 +3236,7 @@ def cmd_create():
             notify("⚠️ Эти утверждения, возможно, не из источников. Проверь до публикации:\n" + lines)
         notify(run_report(story, photos_used, parallax_used, redraws, img_fail, beat, claim_issues))
     save_video(v)
+    ck_done(vid)      # job завершён: тяжёлые артефакты чекпоинта больше не нужны
 
     if AUTO_PUBLISH and IG_TOKEN:
         try:
@@ -2920,12 +3253,19 @@ HELP = ("Я делаю ролики про Free Fire сам по расписа�
         "/make - сделать ролик сразу: бот сам ищет историю и пишет сценарий\n"
         "/make и ниже твой готовый сценарий - ролик по твоему тексту\n"
         "/тема имя или тема - ролик по твоей теме, например: /тема Nobru Бразилия\n"
+        "/настройки - оживление кадров: анимация, число сцен, модель, длительность, качество\n"
+        "/анимация вкл|выкл - включить или выключить оживление кадров\n"
+        "/сцен N - сколько сцен за ролик оживлять (остальные - монтаж кадром)\n"
+        "/длительность 3-10 - секунды на клип оживления (по умолчанию 3 - дешевле)\n"
+        "/качество 480p|720p - разрешение оживления (480p - дешевле)\n"
+        "/модель название - модель видео на сайте, по умолчанию Grok lite\n"
         "/stats - статистика и вывод\n"
         "/status - сколько роликов ждёт решения\n"
         "/igtest - проверить подключение Instagram")
 
 
 def dispatch_create(topic=None, script=None):
+    #(bot.yml передаёт GITHUB_TOKEN только с правом actions: write, это тот же GITHUB_TOKEN из секрета)
     repo, tok = ENV("GITHUB_REPOSITORY"), ENV("GITHUB_TOKEN")
     body = {"ref": ENV("GITHUB_REF_NAME") or "main"}
     inputs = {k: v for k, v in (("topic", topic), ("script", script)) if v}
@@ -2980,6 +3320,46 @@ def handle_message(m):
         pend = sum(1 for v in vs if v["status"] == "pending")
         pub = sum(1 for v in vs if v["status"] == "published")
         tg("sendMessage", chat_id=chat, text=f"Всего: {len(vs)}, ждут решения: {pend}, опубликовано: {pub}")
+    elif cmd in ("/настройки", "/settings", "/настройка"):
+        tg("sendMessage", chat_id=chat, text=settings_text())
+    elif cmd in ("/анимация", "/animation"):
+        arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip().lower()
+        if arg in ("вкл", "on", "1", "в"):
+            save_setting("ANIMATE", "1")
+            tg("sendMessage", chat_id=chat, text="✅ Оживление кадров включено. Применится к следующему ролику.")
+        elif arg in ("выкл", "off", "0"):
+            save_setting("ANIMATE", "0")
+            tg("sendMessage", chat_id=chat, text="✖️ Оживление кадров выключено: сцены монтируются кадром с камерой. Применится к следующему ролику.")
+        else:
+            tg("sendMessage", chat_id=chat, text=settings_text())
+    elif cmd in ("/сцен", "/сцены"):
+        arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip()
+        if arg.isdigit() and 1 <= int(arg) <= 20:
+            save_setting("MAX_ANIMATE", int(arg))
+            tg("sendMessage", chat_id=chat, text=f"✅ Оживляю до {arg} сцен за ролик (остальные - монтаж кадром). Применится к следующему ролику.")
+        else:
+            tg("sendMessage", chat_id=chat, text="Напиши число 1-20 после команды, например: /сцен 6")
+    elif cmd in ("/длительность", "/дл"):
+        arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip()
+        if arg.isdigit() and 3 <= int(arg) <= 10:
+            save_setting("GENSPARK_ANIM_DURATION", int(arg))
+            tg("sendMessage", chat_id=chat, text=f"✅ Длительность оживления: {arg} секунд. Применится к следующему ролику.")
+        else:
+            tg("sendMessage", chat_id=chat, text="Напиши секунды 3-10 после команды, например: /длительность 3")
+    elif cmd in ("/качество", "/quality"):
+        arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip().lower()
+        if arg in ("480p", "720p"):
+            save_setting("GENSPARK_ANIM_QUALITY", arg)
+            tg("sendMessage", chat_id=chat, text=f"✅ Качество оживления: {arg}. Применится к следующему ролику.")
+        else:
+            tg("sendMessage", chat_id=chat, text="Напиши 480p или 720p после команды, например: /качество 480p")
+    elif cmd == "/модель":
+        arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip()
+        if arg and len(arg) <= 60:
+            save_setting("GENSPARK_ANIM_MODEL", arg)
+            tg("sendMessage", chat_id=chat, text=f"✅ Модель видео на сайте: {arg}. Применится к следующему ролику.")
+        else:
+            tg("sendMessage", chat_id=chat, text="Напиши название модели после команды, например: /модель Grok lite")
 
 
 def tg_safe(method, **params):
