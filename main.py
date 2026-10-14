@@ -23,6 +23,8 @@ import time
 
 import requests
 
+import runtime_settings as config
+config.apply()
 ENV = os.environ.get
 OFFLINE = ENV("OFFLINE") == "1"
 
@@ -212,25 +214,15 @@ def get_video(vid):
 # ───────── настройки: меняются ботом, хранятся в data/settings.json (коммитится «Save data») ─────────
 # Файл перекрывает переменные репозитория только по этим ключам; остальное живёт в GitHub Variables.
 SETTINGS_FILE = ROOT / "data" / "settings.json"
-SETTINGS_KEYS = {"ANIMATE", "MAX_ANIMATE", "GENSPARK_ANIM_MODEL", "GENSPARK_ANIM_DURATION",
-                 "GENSPARK_ANIM_QUALITY", "GENSPARK_VIDEO_TIMEOUT", "GENSPARK_VIDEO_URL"}
+SETTINGS_KEYS = set(config.DEFAULTS)
 
 
 def load_settings():
-    try:
-        d = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except Exception:  # noqa
-        return {}
+    return config.load()
 
 
-def save_setting(key, value):
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    d = load_settings()
-    d[key] = str(value)
-    tmp = SETTINGS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, SETTINGS_FILE)
+def save_setting(key,value):
+    return config.save(key,value)
 
 
 def _apply_settings():
@@ -249,18 +241,7 @@ def _apply_settings():
 
 
 def settings_text():
-    d = load_settings()
-    on = d.get("ANIMATE", "1" if ANIMATE_ON else "0")
-    rows = ["⚙️ Настройки оживления",
-            f"анимация: {'вкл' if on.lower() in ('1', 'true', 'yes') else 'выкл'}",
-            f"оживляемых сцен за ролик: {d.get('MAX_ANIMATE', str(MAX_ANIMATE))}",
-            f"модель: {d.get('GENSPARK_ANIM_MODEL', 'Grok lite (по умолчанию)')}",
-            f"длительность: {d.get('GENSPARK_ANIM_DURATION', '3')} с",
-            f"качество: {d.get('GENSPARK_ANIM_QUALITY', '480p')}",
-            "",
-            "Менять: /анимация вкл|выкл · /сцен N · /длительность 3-10 · /качество 480p|720p · /модель название",
-            "Применится к следующему ролику."]
-    return "\n".join(rows)
+    return config.summary()
 
 
 # ───────────── чекпоинты: прогресс сохраняется между аккаунтами и запусками ─────────────
@@ -279,9 +260,17 @@ class QuotaPause(RuntimeError):
 
 
 def _solid(p, min_size):
+    # Content validation instead of arbitrary byte threshold: short real clips can be tiny.
     try:
-        return p.exists() and p.stat().st_size >= min_size
-    except Exception:  # noqa
+        if not p.exists() or p.stat().st_size == 0:
+            return False
+        if p.suffix.lower() in ('.png','.jpg','.jpeg'):
+            from PIL import Image
+            with Image.open(p) as im:
+                im.verify()
+            return True
+        return duration(p) > 0
+    except Exception:
         return False
 
 
@@ -298,26 +287,28 @@ def ck_load(vid):
         return None
 
 
-def ck_put(vid, i=None, story=None, facts=None, sources=None, claims=None, status=None,
-           img=None, voice=None, anim=None):
-    """Атомарно обновляет state.json и копирует артефакты сцены в job-папку.
-    Артефакт считается готовым только если файл существует и не пустой."""
-    d = JOBS / vid
-    d.mkdir(parents=True, exist_ok=True)
+def ck_put(vid,i=None,story=None,facts=None,sources=None,claims=None,status=None,img=None,voice=None,anim=None):
+    if not re.fullmatch(r'\d{8}-\d{6}',vid):
+        raise ValueError('Недопустимый job id')
+    d=JOBS/vid;d.mkdir(parents=True,exist_ok=True)
+    st=ck_load(vid) or {'id':vid,'mode':MODE,'topic':TOPIC,'own_script':bool(SCRIPT_TEXT)}
     if i is not None:
-        sc = CK["scenes"].setdefault(str(i), {})
-        for key, ext, mn in MIN_SIZE:
-            src = {"img": img, "voice": voice, "anim": anim}[key]
-            if src is not None and _solid(pathlib.Path(src), mn):
-                shutil.copy(src, d / f"s{i:02d}_{key}{ext}")
-                sc[key] = True
-        if sc.get("img") and sc.get("voice"):   # кадр и голос готовы: сцену больше не генерируем
-            sc["done"] = True
+        sc=CK['scenes'].setdefault(str(i),{})
+        for key,ext,mn in MIN_SIZE:
+            src={'img':img,'voice':voice,'anim':anim}[key]
+            if src is not None and _solid(pathlib.Path(src),mn):
+                target=d/f's{i:02d}_{key}{ext}'
+                if pathlib.Path(src).resolve()!=target.resolve():
+                    tmp=target.with_suffix('.tmp');shutil.copyfile(src,tmp);os.replace(tmp,target)
+                sc[key]=True
+        sc['assets_ready']=bool(sc.get('img') and sc.get('voice'))
+        sc['done']=bool(sc.get('anim')) # distinguish still assets from completed animated scene
     if story is not None:
-        (d / "story.json").write_text(json.dumps(story, ensure_ascii=False), encoding="utf-8")
-    _atomic_json(d / "state.json", {"id": vid, "status": status or "running", "updated": now_iso(),
-                                    "facts": (facts or "")[:6000], "sources": sources or [],
-                                    "claim_issues": claims or [], "lint": RUN["lint"], "scenes": CK["scenes"]})
+        _atomic_json(d/'story.json',story)
+    for key,val in (('facts',facts),('sources',sources),('claim_issues',claims)):
+        if val is not None:st[key]=val
+    st.update(status=status or 'running',updated=now_iso(),lint=RUN['lint'],scenes=CK['scenes'])
+    _atomic_json(d/'state.json',st)
 
 
 def ck_done(vid):
@@ -328,16 +319,29 @@ def ck_done(vid):
         return
     for p in d.iterdir():
         if p.name != "state.json":
-            p.unlink()
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
     st = ck_load(vid) or {}
     st.update({"status": "done", "updated": now_iso()})
     _atomic_json(d / "state.json", st)
 
 
-def ck_artifact(vid, i, key):
-    ext = dict((k, e) for k, e, _ in MIN_SIZE)[key]
-    p = JOBS / vid / f"s{i:02d}_{key}{ext}"
-    return p if p.exists() else None
+def ck_artifact(vid,i,key):
+    ext=dict((k,e) for k,e,_ in MIN_SIZE)[key]
+    p=JOBS/vid/f's{i:02d}_{key}{ext}'
+    if not p.exists():return None
+    if key=='img':
+        try:
+            from PIL import Image
+            with Image.open(p) as im:im.verify()
+        except Exception:return None
+    else:
+        try:
+            if duration(p)<=0:return None
+        except Exception:return None
+    return p
 
 
 def pick_resume():
@@ -354,12 +358,19 @@ def pick_resume():
     if OFFLINE and not r:      # в офлайн-тесте автопродолжения нет, явный RESUME работает
         return None
     if r:
-        return r if ck_load(r) else (log(f"job {r} не найден, делаю новый"), None)[1]
+        if not re.fullmatch(r'\d{8}-\d{6}',r):
+            raise ValueError('Недопустимый идентификатор job')
+        st=ck_load(r)
+        if not st or st.get('status')=='done':
+            raise ValueError('Job отсутствует или уже завершён')
+        return r
+    if TOPIC or SCRIPT_TEXT:
+        return None
     cands = []
     if JOBS.exists():
         for d in JOBS.iterdir():
             st = ck_load(d.name)
-            if st and st.get("status") == "paused":
+            if st and st.get("status") in ("paused", "running", "failed") and st.get("mode", MODE) == MODE:
                 cands.append((st.get("updated", ""), d.name))
     return max(cands)[1] if cands else None
 
@@ -384,6 +395,8 @@ def notify(text):
         try:
             tg("sendMessage", chat_id=TG_CHAT, text=text[:4000])
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             log("notify failed:", e)
 
 
@@ -458,30 +471,29 @@ def parse_json_loose(text):
 
 
 def genspark_search(prompt):
-    """Поиск фактов через сайт genspark.ai (браузер без API). None - аккаунты не настроены.
-    RuntimeError - сайт не ответил: вызывающий код вернётся к поиску Google в Gemini."""
     import genspark_client
-    if not genspark_client.accounts():
-        return None
     try:
-        return genspark_client.chat(prompt, as_json=False, search=True)
-    except Exception as e:  # noqa
-        raise RuntimeError(str(e))
+        return genspark_client.chat(prompt,as_json=False,search=True)
+    except Exception as e:
+        if isinstance(e, QuotaPause):
+            raise
+        if ENV('GENSPARK_ALLOW_FALLBACK','0') != '1':
+            raise QuotaPause(f'Genspark требует внимания ({type(e).__name__}). Подробности в серверном браузере.') from None
+        return None
 
 
-def smart_json(prompt, models=None):
-    """JSON-ответ: сначала сайт genspark.ai (если аккаунты заданы), иначе Gemini API.
-    Сбой сайта не роняет запуск - просто идём на запасной путь."""
+def smart_json(prompt,models=None):
+    import genspark_client
     if GENSPARK_FIRST:
-        import genspark_client
-        if genspark_client.accounts():
-            try:
-                out = genspark_client.chat(prompt, as_json=True)
-                if out is not None:
-                    return out
-            except Exception as e:  # noqa
-                log("genspark.ai не ответил, ответ через Gemini:", str(e)[:160])
-    return gemini(prompt, models=models)
+        try:
+            return genspark_client.chat(prompt,as_json=True)
+        except Exception as e:
+            if isinstance(e, QuotaPause):
+                raise
+            if ENV('GENSPARK_ALLOW_FALLBACK','0') != '1':
+                raise QuotaPause(f'Запрос Genspark приостановлен ({type(e).__name__})') from None
+            log('Разрешённый запасной путь: Gemini')
+    return gemini(prompt,models=models)
 
 
 def _claude_json_puter(prompt):
@@ -500,6 +512,8 @@ def _claude_json_puter(prompt):
         try:
             return parse_json_loose(content)
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             last = e
             prompt += "\n\nВерни ТОЛЬКО валидный JSON без пояснений."
     raise RuntimeError(f"Claude вернул не JSON: {last}")
@@ -779,6 +793,8 @@ def _dead_token_save(tok):
         TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
         TOKENS_FILE.write_text(json.dumps(rec), encoding="utf-8")
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("не смог записать состояние токенов:", str(e)[:80])
 
 
@@ -840,6 +856,8 @@ def _hf_generate_one(prompt, path, seed, size, space, token, face=None, strength
             _hf["fails"][space] = 0
             return
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             last = e
             low = str(e).lower()
             if "quota" in low or "unauthorized" in low or "invalid token" in low:
@@ -919,6 +937,8 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
             errors.append(f"cloudflare: {str(e)[:100]}")
             quota_note("cf", "ℹ️ Дневной лимит Cloudflare исчерпан на всех аккаунтах. Дальше Hugging Face, Pollinations и Horde.")
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             errors.append(f"cloudflare: {str(e)[:160]}")
             log(f"Cloudflare: {str(e)[:200]}")
         return False
@@ -935,6 +955,8 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
             _hf["dead"].add(IMG2IMG_SPACE)
             quota_note("img2img", "ℹ️ Квота GPU на всех токенах Hugging Face исчерпана, рисую без образца героя")
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             errors.append(f"img2img: {str(e)[:140]}")
     if face and INSTANTID and IMAGE_PROVIDER in ("hf", "auto") and INSTANTID_SPACE not in _hf["dead"]:
         try:       # картинка по лицу героя
@@ -945,6 +967,8 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
             _hf["dead"].add(INSTANTID_SPACE)
             quota_note("instantid", "ℹ️ Квота GPU на всех токенах Hugging Face исчерпана, рисую без привязки к лицу")
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             errors.append(f"InstantID: {str(e)[:160]}")
     if use_hf:
         for space in HF_SPACES:
@@ -959,6 +983,8 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
                 errors.append(f"{space}: квота")
                 quota_note("hf", "ℹ️ Квота GPU Hugging Face исчерпана на всех токенах. Дальше Pollinations и Horde.")
             except Exception as e:  # noqa
+                if isinstance(e, QuotaPause):
+                    raise
                 errors.append(f"{space}: {str(e)[:160]}")
                 log(f"{space}: {str(e)[:200]}")
                 if space in _hf["dead"]:
@@ -977,6 +1003,8 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
             errors.append(f"pollinations: {str(e)[:120]}")
             notify(f"ℹ️ Pollinations недоступен ({str(e)[:140]}). Дальше рисую только через Hugging Face.")
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             errors.append(f"pollinations: {str(e)[:160]}")
     if use_horde and not _hf["horde_dead"]:
         try:
@@ -984,6 +1012,8 @@ def gen_image(kind, prompt, path, seed, refs=None, face=None, init=None, strengt
                            vsize(vertical))
             return
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             errors.append(f"horde: {str(e)[:140]}")
     raise RuntimeError("Не удалось нарисовать картинку: " + (" | ".join(errors) or "лимиты всех сервисов исчерпаны"))
 
@@ -1496,6 +1526,8 @@ def split_voice(wav, phrases, tag):
     try:
         files = split_voice_aligned(wav, phrases, tag)
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("резка озвучки по словам не вышла, режу по паузам:", str(e)[:120])
         files = None
     if files:
@@ -1544,6 +1576,8 @@ def make_all_voices(scenes):
                     _tts_dead.add(model)
                     last = f"{model}: лимит ({str(e)[:100]})"
                 except Exception as e:  # noqa
+                    if isinstance(e, QuotaPause):
+                        raise
                     last = f"{model}: {str(e)[:140]}"
             else:
                 raise RuntimeError(last or "нет доступных моделей")
@@ -1551,6 +1585,8 @@ def make_all_voices(scenes):
                 files[i] = f
         return files
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         notify(f"ℹ️ Gemini TTS недоступен ({str(e)[:200]}). Озвучиваю голосом Microsoft.")
         return None
 
@@ -1586,6 +1622,8 @@ def make_voice(text, path):
                 return
             last = "пустой файл"
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             last = e
         log(f"озвучка: попытка {attempt + 1} не удалась ({last})")
         time.sleep(3 * (attempt + 1))
@@ -1853,12 +1891,16 @@ FRAME_Q = ("Look at this image. Reply with JSON {\"screen\": true/false, \"text\
 
 def frame_problem(path):
     """Причина, по которой кадр надо перерисовать, или None."""
+    if not GEMINI_KEY:
+        return None
     if not FRAME_CHECK or OFFLINE or _vis["fails"] >= 2:
         return None
     try:
         out = gemini_vision_json(FRAME_Q, jpeg_small(path))
         _vis["fails"] = 0
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         _vis["fails"] += 1
         log("проверка кадра пропущена:", str(e)[:100])
         return None
@@ -1893,6 +1935,8 @@ def lint_narration(story):
         out = smart_json(p, models=GEMINI_SCRIPT_MODELS)
         fixed = out.get("fixed") or {}
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("чистка штампов пропущена:", str(e)[:100])
         return 0
     n = 0
@@ -1925,6 +1969,8 @@ def check_claims(story, facts):
         out = smart_json(p)
         issues = [x for x in (out.get("issues") or []) if isinstance(x, dict) and x.get("claim")]
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("проверка фактов пропущена:", str(e)[:100])
         return []
     return issues[:8]
@@ -1963,6 +2009,8 @@ def render_clip_safe(tag, sc, img, d, voice, plan, prev_img, cut):
     try:
         return render_clip(tag, sc, img, d, voice, plan, prev_img, cut)
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         if not plan:
             raise
         RUN["fx_fail"] += 1
@@ -2003,6 +2051,8 @@ def rewrite_image_prompts(story, cast):
                 if str(m_).strip().lower() in ("calm", "tense", "sad", "rise", "epic", "action"):
                     sc["mood"] = str(m_).strip().lower()
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log(f"промпты картинок: второй вызов не удался ({str(e)[:140]}), беру из сценария")
         lst = None
     for i, sc in enumerate(scenes):
@@ -2046,6 +2096,8 @@ def photo_candidates(query):
                             "artist": "Wikipedia", "license": "free license",
                             "page": "https://en.wikipedia.org/wiki/" + quote(p.get("title", "").replace(" ", "_"))})
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("Википедия (фото):", str(e)[:100])
     try:
         r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=30, params={
@@ -2065,6 +2117,8 @@ def photo_candidates(query):
                         "license": (md.get("LicenseShortName") or {}).get("value", "free license"),
                         "page": ii.get("descriptionurl", "")})
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("Commons (фото):", str(e)[:100])
     return [c for c in out if c["url"] and c["w"] >= 700 and c["h"] >= 500
             and not str(c["url"]).lower().endswith((".svg", ".gif", ".tif", ".tiff"))]
@@ -2128,6 +2182,8 @@ def real_photo(sc, out):
         try:
             verdict = gemini_vision_json(q, jpeg_small(data))
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             log("реальное фото: Gemini не смог проверить, рисую сам:", str(e)[:100])
             return None
         if verdict.get("ok") is True:
@@ -2158,6 +2214,8 @@ def whisper_words(wav):
                                           condition_on_previous_text=False)
         return [(w.word.strip(), float(w.start), float(w.end)) for sg in segs for w in (sg.words or []) if w.word.strip()]
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         _wh["dead"] = True
         log("Whisper недоступен, субтитры по длине слов:", str(e)[:120])
         return None
@@ -2346,7 +2404,7 @@ def render_clip_video(tag, sc, video, d, voice=None):
     (короткий ролик зацикливается, длинный обрезается), поверх - слова-субтитры и карточка."""
     total = d + OVERLAP
     out = WORK / f"{tag}_clip.mp4"
-    vf = [f"scale=2160:3840:force_original_aspect_ratio=increase,crop={W}:{H}"]
+    vf = [f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1"]
     for i, (w, a, b, hot) in enumerate(words_timeline(sc["narration"], d, sc.get("accent", []), voice)):
         f = WORK / f"{tag}_w{i}.txt"
         f.write_text(w, encoding="utf-8")
@@ -2373,16 +2431,17 @@ def animate_scene(i, sc, img, voice, tag):
     или бросает QuotaPause - аккаунты/лимиты исчерпаны, job встаёт на паузу."""
     import genspark_client
     if not genspark_client.accounts():
-        log("аккаунты genspark.ai не настроены - сцена остаётся статичным кадром")
-        return None
+        raise QuotaPause("Нет включённых аккаунтов. Войди через export-session.")
     try:
         d = duration(voice)
     except Exception:  # noqa
         d = 5.0
-    out = WORK / f"{tag}_anim.mp4"
+    out = JOBS / CK['vid'] / f"{tag}_anim.mp4"
     try:
         return genspark_client.animate(img, animate_prompt(sc, d), out)
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         raise QuotaPause(f"оживление сцены {i + 1}: {e}") from None
 
 
@@ -2457,6 +2516,8 @@ def prepare_music(scenes=None, seed="v"):
             plan = _fx().plan_music(scenes, seed, WORK)
             return {"plan": plan}
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             log("музыка по настроению не подготовлена, беру один фон:", str(e)[:140])
     return prepare_music_single()
 
@@ -2473,6 +2534,8 @@ def prepare_music_single():
         p, bpm, off = fx.synth_music(100.0, WORK)
         return {"path": p, "bpm": bpm, "offset": off}
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("музыка для монтажа не подготовлена, беру простой фон:", str(e)[:120])
         return None
 
@@ -2584,6 +2647,8 @@ def ig_publish(video_bytes, caption, video_url=None):
             raise RuntimeError(f"загрузка файла: {up.text[:300]}")
         return _ig_wait_and_publish(cid)
     except RuntimeError as e:
+        if isinstance(e, QuotaPause):
+            raise
         problem = str(e)
         if not video_url:
             raise RuntimeError(f"Instagram {problem}. Отправь боту /igtest, он покажет причину.")
@@ -2614,6 +2679,8 @@ def ig_diagnose():
             r = requests.get(f"{FB}/{path}", params=params, timeout=60)
             j = r.json()
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             out.append(f"❌ {title}: {str(e)[:120]}")
             return None
         if r.ok and "error" not in j:
@@ -2667,6 +2734,8 @@ def refresh_stats(limit=10):
                 v["stats"] = {**s, "updated": now_iso()}
                 save_video(v)
         except Exception as e:  # noqa
+            if isinstance(e, QuotaPause):
+                raise
             log("stats error", v["id"], e)
 
 
@@ -2689,6 +2758,8 @@ def stats_report():
             "Вот данные по моим Instagram Reels про Free Fire. Кратко (3 пункта, по-русски): "
             f"что заходит лучше, что хуже, и какую идею снять следующей.\n{data}", as_json=False)
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("gemini analysis failed", e)
     return text
 
@@ -2768,6 +2839,8 @@ def wiki_sources(extra=None):
                         pages.append({"title": hit["title"], "text": text,
                                       "url": f"https://{lang}.wikipedia.org/wiki/" + quote(hit["title"].replace(" ", "_"))})
             except Exception as e:  # noqa
+                if isinstance(e, QuotaPause):
+                    raise
                 log("wiki error:", e)
         if len(pages) >= 5:
             break
@@ -2832,7 +2905,7 @@ def research(videos):
     hist = "\n".join(f"- {v['title']}: {v.get('summary', '')}" for v in videos[-30:]) or "- пока нет"
     people = [str(v.get("person") or "").strip() for v in videos if v.get("person")]
     people_txt = "\n".join(f"- {x}" for x in people) or "- пока нет"
-    use_tavily = bool(TAVILY_KEY)
+    use_tavily = bool(TAVILY_KEY) and not GENSPARK_FIRST
     use_search = (ENV("NO_SEARCH") or "").lower() not in ("1", "true", "yes")
     custom = bool(TOPIC)
     attempts = 3 if custom else 6
@@ -2849,6 +2922,8 @@ def research(videos):
             try:
                 pages = tavily_sources(focus)
             except Exception as e:  # noqa
+                if isinstance(e, QuotaPause):
+                    raise
                 use_tavily = False
                 log("Tavily недоступен:", e)
                 notify(f"ℹ️ Tavily недоступен ({str(e)[:200]}). Пробую другой поиск.")
@@ -2858,14 +2933,20 @@ def research(videos):
             try:
                 text = genspark_search(prompt_r)          # сначала сайт genspark.ai, если аккаунты заданы
                 if text:
-                    srcs = []                             # ссылки сайт кладёт прямо в текст ответа
+                    from urllib.parse import urlparse
+                    urls=list(dict.fromkeys(re.findall(r'https?://[^\s<>\)]+',text)))
+                    srcs=[{'url':u.rstrip('.,;'),'title':urlparse(u).netloc} for u in urls]
             except RuntimeError as e:
+                if isinstance(e, QuotaPause):
+                    raise
                 text = None
                 log("продолжаю через поиск Google в Gemini:", str(e)[:120])
             if text is None:
                 try:
                     text, srcs = gemini_search(prompt_r)
                 except RuntimeError as e:
+                    if isinstance(e, QuotaPause):
+                        raise
                     use_search = False
                     log("поиск Google недоступен:", e)
                     notify(f"ℹ️ Поиск Google в Gemini недоступен ({str(e)[:200]}). Беру факты из Википедии.")
@@ -2906,6 +2987,7 @@ def build_script_prompt(facts, cast):
 def cmd_create():
     WORK.mkdir(exist_ok=True)
     vid = pick_resume() or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    os.environ["GENSPARK_JOB_ID"]=vid
     RUN.update(t0=time.time(), fx_fail=0, lint=0, music="", anim=0, anim_fail=0)
     if set(load_settings()) & SETTINGS_KEYS:
         _apply_settings()
@@ -2914,6 +2996,8 @@ def cmd_create():
     claim_issues = []
     story, facts, sources = None, "", []
     rstate = ck_load(vid) if (JOBS / vid / "state.json").exists() else None
+    if rstate and not (JOBS/vid/'story.json').exists():
+        rstate=None # paused before scenario: scenario still needs validation and saving
     CK.update(vid=vid, scenes=(rstate or {}).get("scenes") or {})
     try:
         refresh_stats()
@@ -2940,16 +3024,18 @@ def cmd_create():
             else:
                 facts, sources = research(videos)
             story = None
-            if PUTER_TOKEN and SCRIPT_WRITER in ("auto", "claude") and story_mode and not SCRIPT_TEXT:
+            if not GENSPARK_FIRST and PUTER_TOKEN and SCRIPT_WRITER in ("auto", "claude") and story_mode and not SCRIPT_TEXT:
                 try:
                     story = _claude_json_puter(build_script_prompt(facts, cast))
                     log(f"сценарий написал Claude ({CLAUDE_MODEL})")
                 except Exception as e:  # noqa
+                    if isinstance(e, QuotaPause):
+                        raise
                     (log if "402" in str(e) else notify)(f"ℹ️ Claude недоступен ({str(e)[:200]}). Сценарий пишет Gemini.")
             if story is None:
                 story = smart_json(build_script_prompt(facts, cast), models=GEMINI_SCRIPT_MODELS)
         else:
-            story = gemini((story_prompt_photo if photo else story_prompt)(videos, cast))
+            story = smart_json((story_prompt_photo if photo else story_prompt)(videos, cast))
         if not rstate:
             story = (validate_story_script(story) if story_mode else
                      validate_photo_story(story) if photo else validate_story(story))
@@ -2975,7 +3061,7 @@ def cmd_create():
                     ensure_character(cast[key]["name"], cast[key]["description"], cast, portrait=False, ref=True)
 
         parts, clips, audios, durs = [], [], [], []
-        voices = make_all_voices(story["scenes"]) if story_mode else None
+        voices = make_all_voices(story["scenes"]) if story_mode and not rstate else None
         plans = trans = mus = beat = plan_m = None
         cum, parallax_used = 0.0, 0
         if story_mode and MONTAGE:
@@ -3002,7 +3088,7 @@ def cmd_create():
                 # дорогая генерация не повторяется - берём готовые артефакты из job-папки
                 st_sc = CK["scenes"].get(str(i)) or {}
                 saved_img, saved_voice = ck_artifact(vid, i, "img"), ck_artifact(vid, i, "voice")
-                restored = bool(st_sc.get("done") and saved_img and saved_voice)
+                restored = bool(saved_img and saved_voice)
                 refs = ref_urls(sc["image_prompt"], cast, have_ref) if (CHAR_REF and IMAGE_PROVIDER == "pollinations") else []
                 extra = ", the characters look exactly like in the reference images" if refs else ""
                 init_ref = None
@@ -3019,8 +3105,8 @@ def cmd_create():
                         if c0 and (c0["dir"] / "face.png").exists():
                             face = c0["dir"] / "face.png"
                             break
-                used_photo = False
-                if restored:
+                used_photo = bool(st_sc.get("used_photo"))
+                if saved_img:
                     shutil.copy(saved_img, img)      # копия в WORK нужна соседним сценам (параллакс, замена)
                     log(f"сцена {i + 1}: уже готова из чекпоинта, генерация пропущена")
                 else:
@@ -3028,6 +3114,8 @@ def cmd_create():
                         try:
                             credit = real_photo(sc, img)
                         except Exception as e:  # noqa
+                            if isinstance(e, QuotaPause):
+                                raise
                             credit = None
                             log("реальное фото не вышло:", str(e)[:120])
                         if credit:
@@ -3058,23 +3146,28 @@ def cmd_create():
                                 except RuntimeError:
                                     pass
                     except RuntimeError as e:
+                        if isinstance(e, QuotaPause):
+                            raise
                         if last_img is None or img_fail > max(4, int(len(story["scenes"]) * 0.4)):
                             raise
                         img_fail += 1
                         log(f"картинка сцены {i + 1} не получилась, беру предыдущую: {str(e)[:120]}")
                         shutil.copy(last_img, img)
+                CK["scenes"].setdefault(str(i),{})["used_photo"]=used_photo
+                ck_put(vid, i=i, img=img, sources=sources)
                 last_img = img
                 try:
                     recent = (recent + [ahash(img)])[-6:]
                 except Exception:  # noqa
                     pass
-                if restored:
+                if saved_voice:
                     voice = saved_voice              # озвучка этой фразы уже готова
                 elif voices:
                     voice = voices[i]
                 else:
                     voice = WORK / f"{tag}.mp3"
                     make_voice(sc["narration"], voice)
+                ck_put(vid, i=i, voice=voice)
                 d = round(max(1.4, duration(voice) + 0.06), 2)
                 if plan_m:
                     sec = plan_m["sections"][plan_m["of_scene"][i]]
@@ -3099,8 +3192,8 @@ def cmd_create():
                 anim = None
                 if restored:
                     anim = ck_artifact(vid, i, "anim")   # готовое видео из чекпоинта, квота не тратится
-                    if anim:
-                        anims_done += 1
+                if anim is None and ANIMATE_ON and not used_photo and anims_done<MAX_ANIMATE and not OFFLINE and over_budget():
+                    raise QuotaPause('Временной бюджет сборки закончился; продолжи следующим /make')
                 # кадр и голос восстановлены, но оживления нет: его доснимает другой аккаунт
                 if anim is None and (story_mode and ANIMATE_ON and not used_photo and anims_done < MAX_ANIMATE
                         and not OFFLINE and not over_budget()):
@@ -3112,8 +3205,9 @@ def cmd_create():
                         ck_put(vid, i=i, img=img, voice=voice)
                         raise
                     except Exception as e:  # noqa
-                        RUN["anim_fail"] += 1
-                        log(f"оживление сцены {i + 1} не вышло, монтирую статичным кадром: {str(e)[:120]}")
+                        if isinstance(e, QuotaPause):
+                            raise
+                        raise QuotaPause('Оживление остановлено; проверь готовый клип, не запускай дубль') from None
                     else:
                         RUN["anim"] += 1
                 if anim:
@@ -3122,10 +3216,10 @@ def cmd_create():
                     clips.append(render_clip_safe(tag, sc, img, d, voice, plans[i] if plans else None, prev_img, cut))
                 audios.append(scene_audio(tag, sc, voice, d))
                 durs.append(d)
-                if not restored:      # сцена целиком готова: кадр, голос, видео -> сразу в чекпоинт
-                    ck_put(vid, i=i, img=img, voice=voice, anim=anim)
-                    if anim:
-                        anims_done += 1
+                was_anim=bool(st_sc.get('anim'))
+                ck_put(vid,i=i,img=img,voice=voice,anim=anim)
+                if anim and not was_anim:
+                    anims_done += 1
                 continue
             if photo:
                 img = WORK / f"{tag}_img.png"
@@ -3157,33 +3251,48 @@ def cmd_create():
         final = WORK / "final.mp4"
         if story_mode and img_fail:
             notify(f"⚠️ Не удалось нарисовать картинок: {img_fail}. Вместо них использованы соседние кадры.")
-        if story_mode:
-            sfx_track = None
-            if plans:
-                try:
-                    fxm = _fx()
-                    ev = fxm.sound_events(durs, story["scenes"], plans, trans, fxm.music_cuts(plan_m) if plan_m else None)
-                    sfx_track = fxm.build_sfx_track(ev, sum(durs) + OVERLAP, WORK, WORK / "sfx_auto.wav")
-                except Exception as e:  # noqa
-                    log("свисты и удары на переходах не получились:", str(e)[:140])
-                if parallax_used:
-                    log(f"параллакс героя в сценах: {parallax_used}")
-            music_arg = mus
-            if plan_m:
-                try:
-                    bed = _fx().build_music_bed(plan_m, sum(durs) + OVERLAP, WORK, WORK / "music_bed.wav")
-                    music_arg = {"path": bed}
-                except Exception as e:  # noqa
-                    log("склейка музыки не вышла, беру один фон:", str(e)[-200:])
-                    music_arg = prepare_music_single()
+        if story_mode and config.get('GENSPARK_FINAL_EDITOR')=='genspark' and not OFFLINE:
+            import editor_client
+            ck_put(vid,story=story,facts=facts,sources=sources,claims=claim_issues,status='running')
             try:
-                assemble(clips, audios, durs, final, trans, sfx_track, music_arg)
-            except Exception as e:  # noqa
-                log(f"сборка с новыми переходами и звуком не вышла ({str(e)[-200:]}), собираю по-простому")
-                RUN["fx_fail"] += 1
-                assemble(clips, audios, durs, final)
+                edited=editor_client.edit(JOBS/vid,story,audios,durs)
+                shutil.copyfile(edited,final)
+            except Exception as e:
+                raise QuotaPause(f'Финальный монтаж приостановлен ({type(e).__name__}); задача и материалы сохранены') from None
         else:
-            concat(parts, final)
+            if story_mode:
+                sfx_track = None
+                if plans:
+                    try:
+                        fxm = _fx()
+                        ev = fxm.sound_events(durs, story["scenes"], plans, trans, fxm.music_cuts(plan_m) if plan_m else None)
+                        sfx_track = fxm.build_sfx_track(ev, sum(durs) + OVERLAP, WORK, WORK / "sfx_auto.wav")
+                    except Exception as e:  # noqa
+                        if isinstance(e, QuotaPause):
+                            raise
+                        log("свисты и удары на переходах не получились:", str(e)[:140])
+                    if parallax_used:
+                        log(f"параллакс героя в сценах: {parallax_used}")
+                music_arg = mus
+                if plan_m:
+                    try:
+                        bed = _fx().build_music_bed(plan_m, sum(durs) + OVERLAP, WORK, WORK / "music_bed.wav")
+                        music_arg = {"path": bed}
+                    except Exception as e:  # noqa
+                        if isinstance(e, QuotaPause):
+                            raise
+                        log("склейка музыки не вышла, беру один фон:", str(e)[-200:])
+                        music_arg = prepare_music_single()
+                try:
+                    assemble(clips, audios, durs, final, trans, sfx_track, music_arg)
+                except Exception as e:  # noqa
+                    if isinstance(e, QuotaPause):
+                        raise
+                    log(f"сборка с новыми переходами и звуком не вышла ({str(e)[-200:]}), собираю по-простому")
+                    RUN["fx_fail"] += 1
+                    assemble(clips, audios, durs, final)
+            else:
+                concat(parts, final)
     except NoStory as e:
         notify(f"🔎 {e}")
         return
@@ -3193,11 +3302,12 @@ def cmd_create():
         ck_put(vid, story=story, facts=facts, sources=sources, claims=claim_issues, status="paused")
         done_n = sum(1 for s in CK["scenes"].values() if s.get("done"))
         log("job встал на паузу до следующего запуска")
-        notify(f"⏸ Лимиты genspark.ai исчерпаны ({str(e)[:140]}). Прогресс сохранён: сценарий и {done_n} готовых сцен. "
-               f"Следующий запуск (по расписанию или /make) продолжит job {vid} с места остановки - уже другой аккаунт.")
+        notify(f"⏸ Требуется внимание: {str(e)[:140]}. Прогресс сохранён (job {vid}). "
+               "Следующий /make продолжит, если не задан новый сценарий. Не запускай генерацию дубля.")
         return
     except Exception as e:
-        notify(f"❌ Не удалось собрать ролик: {e}")
+        ck_put(vid,story=story,facts=facts,sources=sources,claims=claim_issues,status='failed')
+        notify(f"❌ Сборка остановлена ({type(e).__name__}). Job {vid} сохранён; /make для продолжения.")
         raise
 
     v = {"id": vid, "created": now_iso(), "title": story["title"], "person": story.get("title_line", ""), "summary": story.get("summary", ""),
@@ -3210,6 +3320,8 @@ def cmd_create():
     try:
         v["video_url"] = upload_release(vid, v["title"], final)
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log("не удалось сохранить полную версию:", e)
         notify(f"⚠️ Не смог сохранить полную версию ролика на GitHub ({str(e)[:160]}). "
                "Публикация в Instagram возможна только для файлов до 20 МБ.")
@@ -3236,24 +3348,31 @@ def cmd_create():
             notify("⚠️ Эти утверждения, возможно, не из источников. Проверь до публикации:\n" + lines)
         notify(run_report(story, photos_used, parallax_used, redraws, img_fail, beat, claim_issues))
     save_video(v)
-    ck_done(vid)      # job завершён: тяжёлые артефакты чекпоинта больше не нужны
+    if not v.get('video_url'):
+        shutil.copyfile(final,JOBS/vid/'final.mp4')
+        ck_put(vid,status='rendered')
+    else:
+        ck_done(vid)      # job завершён: тяжёлые артефакты чекпоинта больше не нужны
 
     if AUTO_PUBLISH and IG_TOKEN:
         try:
             publish_video(v, final.read_bytes())
             notify(f"✅ Опубликовано в Instagram: {v['title']}")
         except Exception as e:
+            if isinstance(e, QuotaPause):
+                raise
             notify(f"❌ Instagram: {e}")
             raise
 
 
 # ───────────────────────── команда poll ─────────────────────────
 
-HELP = ("Я делаю ролики про Free Fire сам по расписанию.\n"
+HELP = ("Я собираю ролики на серверах GitHub. Для входа и запуска видео может понадобиться ручное действие.\n"
         "/make - сделать ролик сразу: бот сам ищет историю и пишет сценарий\n"
         "/make и ниже твой готовый сценарий - ролик по твоему тексту\n"
         "/тема имя или тема - ролик по твоей теме, например: /тема Nobru Бразилия\n"
-        "/настройки - оживление кадров: анимация, число сцен, модель, длительность, качество\n"
+        "/настройки - все добавленные параметры\n"
+        "/параметр ИМЯ значение - изменить параметр (не секрет)\n"
         "/анимация вкл|выкл - включить или выключить оживление кадров\n"
         "/сцен N - сколько сцен за ролик оживлять (остальные - монтаж кадром)\n"
         "/длительность 3-10 - секунды на клип оживления (по умолчанию 3 - дешевле)\n"
@@ -3266,6 +3385,8 @@ HELP = ("Я делаю ролики про Free Fire сам по расписа�
 
 def dispatch_create(topic=None, script=None):
     #(bot.yml передаёт GITHUB_TOKEN только с правом actions: write, это тот же GITHUB_TOKEN из секрета)
+    if ENV('GITHUB_ACTIONS')=='true':
+        subprocess.run(['bash','save_data.sh'],check=True)
     repo, tok = ENV("GITHUB_REPOSITORY"), ENV("GITHUB_TOKEN")
     body = {"ref": ENV("GITHUB_REF_NAME") or "main"}
     inputs = {k: v for k, v in (("topic", topic), ("script", script)) if v}
@@ -3281,6 +3402,10 @@ def dispatch_create(topic=None, script=None):
 def handle_message(m):
     chat = str(m["chat"]["id"])
     text = (m.get("text") or "").strip()
+    if m['chat'].get('type') in ('group','supergroup'):
+        admin=ENV('TG_ADMIN_ID','')
+        if not admin or str(m.get('from',{}).get('id','')) != admin:
+            return
     if TG_CHAT and chat != str(TG_CHAT):
         return
     if not TG_CHAT:
@@ -3293,7 +3418,7 @@ def handle_message(m):
         arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip()
         if not arg:
             dispatch_create()
-            tg("sendMessage", chat_id=chat, text="Запустил сборку: бот сам найдёт историю. Ролик придёт через 10-20 минут.")
+            tg("sendMessage", chat_id=chat, text="Запустил сборку: бот сам найдёт историю. При необходимости придут ссылки для ручного подтверждения. Готовые материалы сохраняются.")
         elif len(arg) < 80:
             tg("sendMessage", chat_id=chat,
                text="Для /make с текстом нужен готовый сценарий (хотя бы пара предложений). "
@@ -3301,14 +3426,14 @@ def handle_message(m):
         else:
             dispatch_create(script=arg)
             tg("sendMessage", chat_id=chat, text=f"Запустил сборку по твоему сценарию ({len(arg)} символов). "
-                                                 "Ролик придёт через 10-20 минут.")
+                                                 "При необходимости придут ссылки для ручного подтверждения. Готовые материалы сохраняются.")
     elif cmd in ("/тема", "/tema", "/topic"):
         arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip()
         if not arg:
             tg("sendMessage", chat_id=chat, text="Напиши тему после команды, например: /тема Nobru Бразилия")
         else:
             dispatch_create(topic=arg)
-            tg("sendMessage", chat_id=chat, text=f"Запустил сборку по теме: {arg[:200]}\nРолик придёт через 10-20 минут.")
+            tg("sendMessage", chat_id=chat, text=f"Запустил сборку по теме: {arg[:200]}\nПри необходимости придут ссылки для ручного подтверждения. Готовые материалы сохраняются.")
     elif cmd == "/stats":
         tg("sendMessage", chat_id=chat, text="Собираю статистику...")
         tg("sendMessage", chat_id=chat, text=stats_report()[:4000])
@@ -3320,6 +3445,23 @@ def handle_message(m):
         pend = sum(1 for v in vs if v["status"] == "pending")
         pub = sum(1 for v in vs if v["status"] == "published")
         tg("sendMessage", chat_id=chat, text=f"Всего: {len(vs)}, ждут решения: {pend}, опубликовано: {pub}")
+    elif cmd in ('/сброс','/reset'):
+        key=(text.split(maxsplit=1)+[''])[1].strip().upper()
+        try:
+            config.reset(key)
+            tg('sendMessage',chat_id=chat,text=f'✅ {key}: переопределение удалено. Следующий запуск.')
+        except ValueError as e:
+            tg('sendMessage',chat_id=chat,text=str(e))
+    elif cmd in ('/параметр','/set'):
+        parts=text.split(maxsplit=2)
+        if len(parts)<3:
+            tg('sendMessage',chat_id=chat,text='/параметр GENSPARK_ACCOUNTS 2\n/параметр GENSPARK_MANUAL_WAIT 600')
+        else:
+            try:
+                value=save_setting(parts[1].upper(),parts[2])
+                tg('sendMessage',chat_id=chat,text=f'✅ {parts[1].upper()}={value}. Следующий запуск.')
+            except ValueError as e:
+                tg('sendMessage',chat_id=chat,text=str(e))
     elif cmd in ("/настройки", "/settings", "/настройка"):
         tg("sendMessage", chat_id=chat, text=settings_text())
     elif cmd in ("/анимация", "/animation"):
@@ -3368,6 +3510,8 @@ def tg_safe(method, **params):
     try:
         return tg(method, **params)
     except Exception as e:  # noqa
+        if isinstance(e, QuotaPause):
+            raise
         log(f"{method}: {str(e)[:160]}")
         return None
 
@@ -3377,6 +3521,8 @@ def handle_callback(cq):
     if str(TG_CHAT) != chat:
         return
     action, _, vid = cq["data"].partition(":")
+    if action not in ("pub","rej"):
+        return
     qid = cq["id"]
     mid = cq["message"]["message_id"]
     v = get_video(vid)
@@ -3407,6 +3553,8 @@ def handle_callback(cq):
         publish_video(v, data)
         tg_safe("sendMessage", chat_id=chat, text=f"✅ Опубликовано в Instagram: {v['title']}")
     except Exception as e:
+        if isinstance(e, QuotaPause):
+            raise
         v["status"] = "pending"          # можно нажать кнопку ещё раз
         save_video(v)
         tg_safe("editMessageReplyMarkup", chat_id=chat, message_id=mid, reply_markup=buttons)
@@ -3428,6 +3576,8 @@ def cmd_poll():
                 elif "callback_query" in u:
                     handle_callback(u["callback_query"])
             except Exception as e:  # noqa
+                if isinstance(e, QuotaPause):
+                    raise
                 log("handler error:", e)
                 notify(f"⚠️ Ошибка: {e}")
     if offset:
