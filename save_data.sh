@@ -4,7 +4,7 @@ set -euo pipefail
 git rm --cached -r --ignore-unmatch data/jobs >/dev/null
 git config user.name video-bot
 git config user.email video-bot@users.noreply.github.com
-for path in data/videos data/settings.json characters; do
+for path in data/videos data/settings.json data/telegram-ui.json characters; do
   if [[ -e "$path" ]]; then git add -- "$path"; fi
 done
 if git diff --cached --quiet; then exit 0; fi
