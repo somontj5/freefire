@@ -3412,8 +3412,11 @@ def handle_message(m):
         tg("sendMessage", chat_id=chat, text=f"Твой chat id: {chat}\nДобавь его в секрет TG_CHAT_ID.")
         return
     cmd = text.split()[0].split("@")[0].lower() if text else ""
-    if cmd in ("/start", "/help"):
-        tg("sendMessage", chat_id=chat, text=HELP)
+    import telegram_ui
+    if telegram_ui.text(sys.modules[__name__],m):
+        return
+    if cmd in ("/start", "/help", "/menu", "/меню"):
+        telegram_ui.home(sys.modules[__name__],chat)
     elif cmd == "/make":
         arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip()
         if not arg:
@@ -3463,7 +3466,7 @@ def handle_message(m):
             except ValueError as e:
                 tg('sendMessage',chat_id=chat,text=str(e))
     elif cmd in ("/настройки", "/settings", "/настройка"):
-        tg("sendMessage", chat_id=chat, text=settings_text())
+        telegram_ui.settings_menu(sys.modules[__name__],chat,None)
     elif cmd in ("/анимация", "/animation"):
         arg = (re.split(r"\s+", text, maxsplit=1) + [""])[1].strip().lower()
         if arg in ("вкл", "on", "1", "в"):
@@ -3517,11 +3520,18 @@ def tg_safe(method, **params):
 
 
 def handle_callback(cq):
+    import telegram_ui
+    if telegram_ui.callback(sys.modules[__name__],cq):
+        return
+    if not telegram_ui.allowed(sys.modules[__name__],cq):
+        tg_safe('answerCallbackQuery',callback_query_id=cq['id'],text='Нет доступа')
+        return
     chat = str(cq["message"]["chat"]["id"])
     if str(TG_CHAT) != chat:
         return
     action, _, vid = cq["data"].partition(":")
     if action not in ("pub","rej"):
+        tg_safe('answerCallbackQuery',callback_query_id=cq['id'],text='Кнопка устарела — открой меню')
         return
     qid = cq["id"]
     mid = cq["message"]["message_id"]
@@ -3562,6 +3572,10 @@ def handle_callback(cq):
 
 
 def cmd_poll():
+    import telegram_ui
+    if telegram_ui.browser_running():
+        log('Работает браузерная задача: подтверждения принимает она, второй poller не запускается.')
+        return
     end = time.time() + 50
     offset = None
     while time.time() < end:
@@ -3569,6 +3583,8 @@ def cmd_poll():
         if offset:
             params["offset"] = offset
         for u in tg("getUpdates", **params):
+            if telegram_ui.browser_running():
+                return # don't acknowledge updates intended for the live workflow
             offset = u["update_id"] + 1
             try:
                 if "message" in u:
