@@ -1,0 +1,93 @@
+name: export-session
+on:
+  workflow_dispatch:
+    inputs:
+      cookies:
+        description: "Куки genspark.ai (JSON Cookie Editor или строки name=value). Пусто = только проверка already-заданных секретов"
+        required: false
+        default: ""
+      verify_client:
+        description: "Проверить клиента genspark_client тестовым вопросом"
+        required: false
+        default: "true"
+
+concurrency:
+  group: export-session
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+      - run: pip install -q playwright requests
+      - name: Collect session from cookies
+        if: ${{ inputs.cookies != '' }}
+        env:
+          COOKIES: ${{ inputs.cookies }}
+        run: |
+          python - <<'EOF'
+          import os, pathlib
+          raw = os.environ.get("COOKIES", "").strip()
+          if raw:
+              pathlib.Path("cookies.txt").write_text(raw, encoding="utf-8")
+              print("куки получены из формы запуска")
+          else:
+              print("куки не переданы")
+          EOF
+          if [ -s cookies.txt ]; then python export_from_cookies.py cookies.txt -o genspark_session.json; fi
+      - name: Verify saved secrets (GENSPARK_STORAGE_1..3 / GENSPARK_STORAGES)
+        if: ${{ inputs.cookies == '' }}
+        env:
+          GENSPARK_ACCOUNTS: "all"
+          GENSPARK_STORAGES: ${{ secrets.GENSPARK_STORAGES }}
+          GENSPARK_STORAGE_1: ${{ secrets.GENSPARK_STORAGE_1 }}
+          GENSPARK_STORAGE_2: ${{ secrets.GENSPARK_STORAGE_2 }}
+          GENSPARK_STORAGE_3: ${{ secrets.GENSPARK_STORAGE_3 }}
+        run: |
+          python - <<'EOF'
+          import genspark_client as gc
+          accs = gc.accounts_all()
+          print(f"найдено аккаунтов: {len(accs)}")
+          for name, _ in accs:
+              print(" -", name)
+          if not accs:
+              print("НИ ОДНОГО: экспортируй сессию через форму запуска (поле cookies)")
+          EOF
+      - name: Live test of genspark_client
+        if: ${{ inputs.verify_client == 'true' }}
+        env:
+          GENSPARK_ACCOUNTS: ${{ vars.GENSPARK_ACCOUNTS }}
+          GENSPARK_STORAGES: ${{ secrets.GENSPARK_STORAGES }}
+          GENSPARK_STORAGE_1: ${{ secrets.GENSPARK_STORAGE_1 }}
+          GENSPARK_STORAGE_2: ${{ secrets.GENSPARK_STORAGE_2 }}
+          GENSPARK_STORAGE_3: ${{ secrets.GENSPARK_STORAGE_3 }}
+          GENSPARK_TIMEOUT: "240"
+          GENSPARK_RETRIES: "1"
+        run: |
+          python - <<'EOF'
+          import genspark_client as gc
+          accs = gc.accounts_all()
+          if not accs:
+              print("Пропускаю: секретов сессий нет")
+          else:
+              print("Ответ сайта:", gc.chat("Скажи привет одним коротким предложением.", as_json=False))
+          EOF
+      - name: Upload session file as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genspark-session
+          path: |
+            genspark_session.json
+            work/genspark/**
+          if-no-files-found: ignore
