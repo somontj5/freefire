@@ -35,6 +35,30 @@ def normalize(c):
             "sameSite": SAME_SITE.get(ss, "Lax")}
 
 
+def netscape_cookies(text):
+    """Формат Netscape (кнопка «Export» в Cookie Editor): 7 полей через таб.
+    domain<TAB>flag<TAB>path<TAB>secure<TAB>expiration<TAB>name<TAB>value"""
+    out = []
+    for line in text.replace("\r", "").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#") or "\t" not in line:
+            continue
+        f = line.split("\t")
+        if len(f) < 7 or not f[5].strip():
+            continue
+        domain, _flag, path, secure, exp, name, value = f[:7]
+        try:
+            expires = float(exp)
+        except Exception:  # noqa
+            expires = -1.0
+        out.append({"name": name.strip(), "value": value.strip(),
+                    "domain": domain.strip() or DEFAULT_DOMAIN,
+                    "path": path.strip() or "/", "expires": expires,
+                    "httpOnly": False, "secure": secure.strip().upper() == "TRUE",
+                    "sameSite": "Lax"})
+    return out
+
+
 def string_cookies(text):
     out = []
     for part in text.replace("\n", ";").split(";"):     # и через точку с запятой, и построчно
@@ -50,6 +74,11 @@ def parse_cookies(text):
     text = text.strip()
     if not text:
         sys.exit("Файл с куками пуст")
+    # формат Netscape (кнопка «Export»): табы между полями - разбираем сразу, до попытки JSON
+    if "\t" in text and "{" not in text[:200]:
+        ns = netscape_cookies(text)
+        if ns:
+            return ns
     try:
         data = json.loads(text)
     except Exception:  # noqa
