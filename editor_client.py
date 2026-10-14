@@ -88,7 +88,8 @@ def _edit_one(name,storage,folder,archive,manifest,ledger,target):
     ctx=gc._context(name,storage);pending=read(ledger)
     page=gc._ready(name,ctx,pending.get('url') or gc.base_url());page.bring_to_front()
     files=[p for p in folder.iterdir() if p.is_file()]
-    instructions=(f'Смонтируй вертикальный ролик по приложенным материалам и project.json. '
+    instructions=(f'Используй инструменты Genspark для монтажа видео, генерации музыки, субтитров и моушен-дизайна. '
+                  f'Смонтируй вертикальный ролик по приложенным материалам и project.json. '
                   f'Озвучку narration.wav сохрани целиком. Длительность около {manifest["total_duration"]:.1f} с. '
                   'Нарежь готовые клипы под диктора, добавь музыку по настроению, русские субтитры по словам, '
                   'уместные SFX и моушен-дизайн: анимированные заголовки, карточки и графику. '
