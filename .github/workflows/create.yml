@@ -29,9 +29,12 @@ jobs:
       run: python -m playwright install --with-deps chromium
     - name: Connect private Tailscale network
       uses: tailscale/github-action@v4
-      with:
-        oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-        oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+            with:
+        authkey: ${{ secrets.TS_AUTHKEY }}
+        tags: tag:ci
+        hostname: ff-${{ github.run_id }}-${{ github.run_attempt }}
+        log-mode: normal
+
         tags: tag:ci
         hostname: ff-${{ github.run_id }}-${{ github.run_attempt }}
         log-mode: normal
