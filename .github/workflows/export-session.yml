@@ -55,12 +55,16 @@ jobs:
           sudo apt-get install -y ffmpeg fonts-dejavu-core xvfb x11vnc novnc websockify fluxbox x11-utils
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
+      - name: Prepare private Tailscale state directory
+        run: |
+          sudo install -d -m 700 -o root -g root /var/lib/tailscale
       - name: Connect private Tailscale network
         id: tailscale
         continue-on-error: true
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
+          statedir: /var/lib/tailscale
           tags: tag:ci
           hostname: ff-${{ github.run_id }}-${{ github.run_attempt }}
           log-mode: normal
