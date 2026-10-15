@@ -31,7 +31,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Validate Tailscale auth key
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
@@ -40,29 +39,22 @@ jobs:
             echo "::error::Create TS_AUTHKEY in GitHub Secrets using a Tailscale Auth key."
             exit 1
           fi
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
       - name: Install Python dependencies
         run: python -m pip install playwright requests 'cryptography>=43'
-
       - name: Validate encrypted backup secret
         run: python runner_state.py validate-key
-
       - name: Restore encrypted progress
         run: python runner_state.py restore
-
       - name: Install desktop and media tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-dejavu-core xvfb x11vnc novnc websockify fluxbox x11-utils
-
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
-
       - name: Connect private Tailscale network
         id: tailscale
         continue-on-error: true
@@ -74,26 +66,34 @@ jobs:
           log-mode: normal
           timeout: 2m
           retry: "2"
-
       - name: Diagnose Tailscale connection failure
         if: ${{ always() && steps.tailscale.outcome == 'failure' }}
         run: |
           echo "::error::Tailscale login failed. Check TS_AUTHKEY, its expiry and tag:ci."
           sudo tailscale status 2>&1 | sed -E 's/tskey-[A-Za-z0-9_-]+/[REDACTED]/g' || true
-
       - name: Start private remote desktop
         id: remote_desktop
         if: ${{ steps.tailscale.outcome == 'success' }}
-        run: bash runner_remote.sh
-
+        run: |
+          bash runner_remote.sh
+          echo "Checking private HTTPS endpoints, not just Tailscale device status."
+          sudo tailscale serve status
+          host=$(sudo tailscale status --json | python3 -c 'import json,sys; h=json.load(sys.stdin)["Self"]["DNSName"].rstrip("."); assert h.endswith(".ts.net") and all(c.isalnum() or c in ".-" for c in h), "Invalid Tailscale DNS name"; print(h)')
+          if ! curl --fail --show-error --silent --retry 2 --retry-all-errors --connect-timeout 5 --max-time 15 "https://${host}/vnc.html" --output /dev/null; then
+            echo "::error::Private HTTPS screen is unavailable. Check the curl error and Tailscale Serve configuration above."
+            exit 1
+          fi
+          if ! curl --fail --show-error --silent --retry 2 --retry-all-errors --connect-timeout 5 --max-time 15 "https://${host}:8443/" --output /dev/null; then
+            echo "::error::Private HTTPS confirmation page is unavailable."
+            exit 1
+          fi
+          echo "Private HTTPS endpoints responded successfully from the runner. Phone access still depends on tailnet connectivity and ACLs."
       - name: Login manually without printing sessions
         if: ${{ steps.tailscale.outcome == 'success' && steps.remote_desktop.outcome == 'success' }}
         run: python run_job.py login
-
       - name: Encrypt progress and sessions
         if: always()
         run: python runner_state.py snapshot
-
       - name: Upload encrypted checkpoint
         if: always()
         uses: actions/upload-artifact@v4
@@ -102,15 +102,12 @@ jobs:
           path: state-backup/state.enc
           if-no-files-found: warn
           retention-days: 14
-
       - name: Save non-secret history and settings
         if: always()
         run: bash save_data.sh
-
       - name: Close private remote access
         if: ${{ always() && steps.tailscale.outcome == 'success' }}
         run: sudo tailscale serve reset || true
-
       - name: Report failed remote connection
         if: ${{ always() && steps.tailscale.outcome == 'failure' }}
         run: |
