@@ -1,24 +1,88 @@
-#!/usr/bin/env python3
-"""Optional LOCAL desktop login, never prints base64 or cookies."""
-import argparse
-import json
-import os
-from pathlib import Path
-from playwright.sync_api import sync_playwright
-
-
-def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('-o','--out',default='private-runtime/sessions/account-1.json')
-    args=ap.parse_args()
-    with sync_playwright() as pw:
-        b=pw.chromium.launch(headless=False)
-        try:
-            ctx=b.new_context()
-            p=ctx.new_page();p.goto('https://www.genspark.ai',wait_until='domcontentloaded')
-            input('Войди вручную и пройди проверку. Затем Enter для сохранения (значения не печатаются): ')
-            target=Path(args.out);target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-            target.write_text(json.dumps(ctx.storage_state()),encoding='utf8');os.chmod(target,0o600)
-            print('Сессия сохранена локально. Не публикуй файл.')
-        finally:b.close()
-if __name__=='__main__':main()
+name: export-session
+'on':
+  workflow_dispatch: {}
+concurrency:
+  group: browser-${{ github.ref_name }}
+  cancel-in-progress: false
+permissions:
+  contents: write
+  actions: read
+jobs:
+  login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      GENSPARK_ACCOUNTS: ${{ vars.GENSPARK_ACCOUNTS }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GENSPARK_MANUAL_WAIT: ${{ vars.GENSPARK_MANUAL_WAIT }}
+      GENSPARK_REMOTE: '1'
+      GENSPARK_HEADLESS: '0'
+      SESSION_BACKUP_KEY: ${{ secrets.SESSION_BACKUP_KEY }}
+      REMOTE_DESKTOP_PASSWORD: ${{ secrets.REMOTE_DESKTOP_PASSWORD }}
+      DISPLAY: :99
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: pip
+    - name: Install Python dependencies
+      run: python -m pip install playwright requests 'cryptography>=43'
+    - name: Validate encrypted backup secret
+      run: python runner_state.py validate-key
+    - name: Restore previous encrypted progress
+      run: python runner_state.py restore
+    - name: Install desktop and media tools
+      run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core xvfb x11vnc novnc websockify fluxbox x11-utils
+    - name: Install Chromium
+      run: python -m playwright install --with-deps chromium
+    - name: Connect private Tailscale network
+      uses: tailscale/github-action@v4
+      with:
+        oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+        oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+        tags: tag:ci
+        hostname: ff-${{ github.run_id }}-${{ github.run_attempt }}
+        log-mode: normal
+        timeout: 2m
+        retry: '5'
+      id: tailscale
+      continue-on-error: true
+    - name: Diagnose Tailscale connection failure
+      if: ${{ always() && steps.tailscale.outcome == 'failure' }}
+      run: "echo 'Tailscale connection failed. No browser or video generation will start.'\necho 'Check OAuth auth_keys write scope, allowed tag:ci, secret\
+        \ values and Tailnet Lock.'\necho 'Enable the GitHub Actions secret ACTIONS_STEP_DEBUG=true for a diagnostic re-run.'\nsudo tailscale status 2>&1\
+        \ | sed -E 's/tskey-[A-Za-z0-9_-]+/[REDACTED]/g' || true\nsudo journalctl -u tailscaled --no-pager 2>&1 | tail -50 | sed -E 's/tskey-[A-Za-z0-9_-]+/[REDACTED]/g'\
+        \ || true\nif [ -n \"${GITHUB_STEP_SUMMARY:-}\" ]; then\n  echo '## Tailscale connection failed: browser/login/video were NOT started. Inspect the\
+        \ connection step and diagnostics.' >> \"$GITHUB_STEP_SUMMARY\"\nfi"
+    - name: Start private remote desktop
+      run: bash runner_remote.sh
+      id: remote_desktop
+      if: ${{ steps.tailscale.outcome == 'success' }}
+    - name: Login manually without printing sessions
+      run: python run_job.py login
+      if: ${{ steps.tailscale.outcome == 'success' && steps.remote_desktop.outcome == 'success' }}
+    - name: Encrypt progress and sessions
+      if: always()
+      run: python runner_state.py snapshot
+    - name: Upload encrypted checkpoint
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: freefire-state-${{ github.run_id }}-${{ github.run_attempt }}
+        path: state-backup/state.enc
+        if-no-files-found: warn
+        retention-days: 14
+    - name: Save non-secret history and settings
+      if: always()
+      run: bash save_data.sh
+    - name: Close private remote access
+      if: ${{ always() && steps.tailscale.outcome == 'success' }}
+      run: sudo tailscale serve reset || true
+    - name: Report failed remote connection
+      if: ${{ always() && steps.tailscale.outcome == 'failure' }}
+      run: echo 'Connection failed; diagnostics and safe cleanup completed. This is not a successful login.'; exit 1
