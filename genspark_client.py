@@ -70,9 +70,13 @@ def accounts_all():
     for k in sorted((k for k in os.environ if re.fullmatch(r'GENSPARK_STORAGE_\d+',k)),key=lambda k:int(k.rsplit('_',1)[1])):
         if os.environ[k].strip():out.append((f'account-{k.rsplit("_",1)[1]}',_parse_storage(os.environ[k],k)))
     # Include encrypted restored sessions and empty accounts for manual server-side login.
+    # Свежие файлы сессий важнее старых секретов GENSPARK_STORAGE_N: при совпадении имени берём восстановленный файл.
     if SESSIONS.exists():
-        for p in sorted(SESSIONS.glob('account-*.json')):
-            if p.stem not in {name for name,_ in out}:out.append((p.stem,read(p)))
+        restored={p.stem:read(p) for p in sorted(SESSIONS.glob('account-*.json'))}
+        out=[(n,restored[n]) if n in restored else (n,st) for n,st in out]
+        known={name for name,_ in out}
+        for n,st in restored.items():
+            if n not in known:out.append((n,st))
     if not out and remote():
         n=os.environ.get('GENSPARK_ACCOUNTS') or '1'
         if n=='all':n='1'
@@ -186,21 +190,29 @@ def _first(page,selectors,timeout_ms=8000):
     return None
 
 
+def body_text(page,timeout_ms=3000):
+    # Пустая/закрытая/падшая вкладка не должна ронять задачу — просто считаем, что текста нет.
+    try:return page.locator('body').inner_text(timeout=timeout_ms).lower()
+    except Exception:return ''
+
+
 def _login_visible(page):
-    u=page.url.lower()
-    if any(x in u for x in ('/login','/signin','accounts.google.com')):return True
-    for label in ('Войти','Sign in','Log in'):
-        if page.get_by_text(label,exact=True).first.is_visible():return True
+    try:
+        u=page.url.lower()
+        if any(x in u for x in ('/login','/signin','accounts.google.com')):return True
+        for label in ('Войти','Sign in','Log in'):
+            if page.get_by_text(label,exact=True).first.is_visible():return True
+    except Exception:return False
     return False
 
 
 def challenge(page):
-    text=page.locator('body').inner_text(timeout=3000).lower()
+    text=body_text(page)
     return any(s in text for s in ('performing security verification','verify you are human','проверка безопасности','checking your browser'))
 
 
 def quota(page):
-    text=page.locator('body').inner_text(timeout=3000).lower()
+    text=body_text(page)
     return any(s in text for s in ('insufficient credits','not enough credits','daily limit reached','недостаточно кредитов','дневной лимит исчерпан'))
 
 
@@ -214,10 +226,13 @@ def notify(message,markup=None):
 
 
 _telegram_offset=None
+_telegram_live_polling=False
 
 
 def _telegram_tick():
     global _telegram_offset
+    if _telegram_live_polling:
+        return # the background service is the only getUpdates consumer for this job
     if not os.environ.get('TG_TOKEN') or not os.environ.get('TG_CHAT_ID'):return
     import requests
     import main as api
@@ -267,15 +282,31 @@ def human(message,on_tick=None):
 
 
 def _ready(name,ctx,url):
-    pg=ctx.new_page();pg.set_default_timeout(page_timeout_ms())
-    pg.goto(url,wait_until='domcontentloaded');pg.wait_for_timeout(1500)
-    if challenge(pg) or _login_visible(pg):
-        pg.bring_to_front()
-        human(f'{name}: пройди проверку Cloudflare или войди в Genspark вручную. Затем нажми «Выполнено».')
-        pg.wait_for_timeout(1000)
-        if challenge(pg) or _login_visible(pg):raise ManualRequired('Проверка/вход ещё не завершены. Обход защиты не используется.')
-    _persist(name,ctx)
-    return pg
+    for attempt in (1,2):
+        pg=ctx.new_page();pg.set_default_timeout(page_timeout_ms())
+        try:pg.goto(url,wait_until='domcontentloaded')
+        except Exception as e:
+            log(f'{name}: загрузка не завершилась ({type(e).__name__}); попытка {attempt}/2.')
+            try:pg.close()
+            except Exception:pass
+            continue
+        pg.wait_for_timeout(1500)
+        if not body_text(pg):
+            # Вкладка открылась пустой (страница не догрузилась или рендер упал) — пересоздаю вкладку.
+            log(f'{name}: вкладка открылась пустой; попытка {attempt}/2.')
+            try:pg.close()
+            except Exception:pass
+            continue
+        if challenge(pg) or _login_visible(pg):
+            pg.bring_to_front()
+            while True:
+                human(f'{name}: пройди проверку Cloudflare и войди в Genspark вручную. Затем нажми «Выполнено».')
+                pg.wait_for_timeout(1000)
+                if not challenge(pg) and not _login_visible(pg):break
+                log(f'{name}: вход ещё не завершён; открой экран снова и продолжай — задача не падает.')
+        _persist(name,ctx)
+        return pg
+    raise ManualRequired('Страница Genspark не открылась после двух попыток; прогресс сохранён.')
 
 
 def _answer_text(page):
@@ -465,12 +496,18 @@ def animate(image_path,prompt,out_path=None):
 
 
 def login_accounts():
+    saved=[]
     for name,st in accounts():
-        ctx=_context(name,st);pg=_ready(name,ctx,base_url());pg.bring_to_front()
-        human(f'{name}: проверь, что открыт нужный аккаунт Genspark. Нажми «Выполнено» для сохранения сессии.')
-        if _login_visible(pg) or challenge(pg):raise ManualRequired('Вход не подтверждён')
-        _persist(name,ctx)
+        try:
+            ctx=_context(name,st);pg=_ready(name,ctx,base_url())
+        except ManualRequired:raise
+        except Exception as e:
+            log(f'{name}: вкладка не открылась ({type(e).__name__}); перехожу к следующему аккаунту.')
+            continue
+        _persist(name,ctx);saved.append(name)
+        log(f'{name}: сессия жива и сохранена.')
     print('Сессии сохранены приватно; резерв будет зашифрован. Сами значения не выводятся.')
+    if not saved:raise ManualRequired('Ни одна сессия не сохранена; смотри логи выше.')
 
 
 if __name__=='__main__':
