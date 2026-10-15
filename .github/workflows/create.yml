@@ -34,10 +34,25 @@ jobs:
         oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
         tags: tag:ci
         hostname: ff-${{ github.run_id }}-${{ github.run_attempt }}
+        log-mode: normal
+        timeout: 2m
+        retry: '5'
+      id: tailscale
+      continue-on-error: true
+    - name: Diagnose Tailscale connection failure
+      if: ${{ always() && steps.tailscale.outcome == 'failure' }}
+      run: "echo 'Tailscale connection failed. No browser or video generation will start.'\necho 'Check OAuth auth_keys write scope, allowed tag:ci, secret\
+        \ values and Tailnet Lock.'\necho 'Enable the GitHub Actions secret ACTIONS_STEP_DEBUG=true for a diagnostic re-run.'\nsudo tailscale status 2>&1\
+        \ | sed -E 's/tskey-[A-Za-z0-9_-]+/[REDACTED]/g' || true\nsudo journalctl -u tailscaled --no-pager 2>&1 | tail -50 | sed -E 's/tskey-[A-Za-z0-9_-]+/[REDACTED]/g'\
+        \ || true\nif [ -n \"${GITHUB_STEP_SUMMARY:-}\" ]; then\n  echo '## Tailscale connection failed: browser/login/video were NOT started. Inspect the\
+        \ connection step and diagnostics.' >> \"$GITHUB_STEP_SUMMARY\"\nfi"
     - name: Start private remote desktop
       run: bash runner_remote.sh
+      id: remote_desktop
+      if: ${{ steps.tailscale.outcome == 'success' }}
     - name: Create video
       run: python run_job.py create
+      if: ${{ steps.tailscale.outcome == 'success' && steps.remote_desktop.outcome == 'success' }}
     - name: Encrypt progress and sessions
       if: always()
       run: python runner_state.py snapshot
@@ -53,8 +68,11 @@ jobs:
       if: always()
       run: bash save_data.sh
     - name: Close private remote access
-      if: always()
+      if: ${{ always() && steps.tailscale.outcome == 'success' }}
       run: sudo tailscale serve reset || true
+    - name: Report failed remote connection
+      if: ${{ always() && steps.tailscale.outcome == 'failure' }}
+      run: echo 'Connection failed; diagnostics and safe cleanup completed. This is not a successful login.'; exit 1
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
