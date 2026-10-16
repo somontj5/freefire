@@ -37,16 +37,34 @@ def render(api,chat,mid,text,rows):
     else:api.tg('sendMessage',chat_id=chat,text=text,reply_markup=keyboard(rows))
 
 
+def job_active():return os.environ.get('GENSPARK_WORKER_ACTIVE')=='1'
+
+
 def home(api,chat,mid=None):
-    render(api,chat,mid,'🎬 Freefire — управление\nВсё обрабатывается на серверах GitHub. Телефон — только пульт.',[
+    rows=[
         [button('🎬 Создать / продолжить','m:make'),button('📝 Свой сценарий','m:script')],
         [button('💡 Тема','m:topic'),button('🔐 Вход в аккаунты','m:login')],
         [button('⚙️ Настройки','m:settings'),button('📊 Статус','m:status')],
-        [button('📈 Статистика','m:stats')]])
+        [button('📈 Статистика','m:stats')]]
+    screen=os.environ.get('GENSPARK_REMOTE_SCREEN','')
+    if job_active() and screen:
+        rows.insert(0,[{'text':'🌐 Открыть текущий браузер','url':screen}])
+    text='🎬 Freefire — управление\nВсё обрабатывается на серверах GitHub. Телефон — только пульт.'
+    if job_active():text+='\n🟢 Серверная задача активна. Меню доступно без ожидания cron.'
+    render(api,chat,mid,text,rows)
+
+
+def busy(api,chat,mid):
+    rows=[[button('📊 Текущий прогресс','m:status')],[button('⬅️ Меню','m:home')]]
+    screen=os.environ.get('GENSPARK_REMOTE_SCREEN','')
+    if screen:rows.insert(0,[{'text':'🌐 Открыть браузер','url':screen}])
+    render(api,chat,mid,'🟢 Уже выполняется серверная задача. Вторую сборку/вход не запускаю. '
+           'Настройки можно менять для следующего запуска.',rows)
+
 
 
 PICKS={
- 'GENSPARK_ACCOUNTS':['1','2','3','4','all'], 'GENSPARK_ANIM_DURATION':['3','4','5'],
+ 'GENSPARK_ACCOUNTS':['1','2','3','4','5','10','all'], 'GENSPARK_ANIM_DURATION':['3','4','5'],
  'GENSPARK_ANIM_QUALITY':['480p','720p'], 'GENSPARK_ANIM_MODEL':['Grok lite'],
  'MAX_ANIMATE':['3','6','10','20'], 'ANIMATE':['1','0'],
  'GENSPARK_MANUAL_WAIT':['300','600','900'], 'GENSPARK_VIDEO_MODE':['agent','manual'],
@@ -93,11 +111,25 @@ def callback(api,cq):
         elif data=='m:settings':settings_menu(api,chat,mid)
         elif data in ('m:script','m:topic'):ask_text(api,chat,mid,data.split(':')[1])
         elif data=='m:make':
+            if job_active():
+                busy(api,chat,mid);return True
             api.dispatch_create();render(api,chat,mid,'▶️ Запуск отправлен. При проверке придут кнопки прямо сюда.',[[button('⬅️ Меню','m:home')]])
         elif data=='m:login':
+            if job_active():
+                busy(api,chat,mid);return True
             dispatch_login(api);render(api,chat,mid,'🔐 Запущен серверный вход. Жди кнопку «Открыть браузер» здесь, в Telegram.',[[button('⬅️ Меню','m:home')]])
         elif data=='m:status':
-            vs=api.load_videos();render(api,chat,mid,f'📊 Роликов: {len(vs)}\nОжидают решения: {sum(v.get("status")=="pending" for v in vs)}',[[button('⬅️ Меню','m:home')]])
+            vs=api.load_videos()
+            text=f'📊 Роликов: {len(vs)}\nОжидают решения: {sum(v.get("status")=="pending" for v in vs)}'
+            if job_active():
+                state=getattr(api,'CK',{})
+                scenes=list((state.get('scenes') or {}).values())
+                text+=f'\n🟢 Сейчас: {os.environ.get("GENSPARK_TASK","create")}'
+                if state.get('vid'):text+=f'\nJob: {state["vid"]}'
+                text+=f'\nКадров: {sum(bool(x.get("img")) for x in scenes)}'
+                text+=f' · озвучек: {sum(bool(x.get("voice")) for x in scenes)}'
+                text+=f' · клипов: {sum(bool(x.get("anim")) for x in scenes)}'
+            render(api,chat,mid,text,[[button('🔄 Обновить','m:status')],[button('⬅️ Меню','m:home')]])
         elif data=='m:stats':render(api,chat,mid,api.stats_report()[:3800],[[button('⬅️ Меню','m:home')]])
         elif data.startswith('m:advanced:'):
             page=int(data.rsplit(':',1)[1]);keys=list(config.DEFAULTS);subset=keys[page*6:page*6+6]
@@ -110,9 +142,11 @@ def callback(api,cq):
         elif data.startswith('k:'):
             key=data[2:]
             if key not in config.DEFAULTS:raise ValueError('Неизвестный параметр')
-            rows=[[button(value,f'v:{key}:{value}')] for value in PICKS.get(key,[])]
+            rows=[[button({'all':'all — только сохранённые'}.get(value,value),f'v:{key}:{value}')] for value in PICKS.get(key,[])]
             rows += [[button('✏️ Своё значение','m:custom:'+key)], [button('↩️ Сбросить','r:'+key)],[button('⬅️ Настройки','m:settings')]]
-            render(api,chat,mid,f'{LABELS.get(key,key)}\nСейчас: {config.get(key)}',rows)
+            hint=''
+            if key=='GENSPARK_ACCOUNTS':hint='\nЧисло = сколько аккаунтов использовать. «all» — только уже сохранённые сессии и секреты, новых слотов не создаёт. Чтобы войти в новый аккаунт, укажи число больше текущего.'
+            render(api,chat,mid,f'{LABELS.get(key,key)}\nСейчас: {config.get(key)}{hint}',rows)
         elif data.startswith('m:custom:'):ask_text(api,chat,mid,'setting',data.split(':',2)[2])
         elif data.startswith('v:'):
             _,key,value=data.split(':',2);config.save(key,value);settings_menu(api,chat,mid)
@@ -130,6 +164,8 @@ def text(api,m):
     mid=pending['message_id']
     try:
         kind=pending['kind']
+        if kind in ('script','topic') and job_active():
+            busy(api,chat,mid);return True
         if kind=='setting':config.save(pending['key'],value);settings_menu(api,chat,mid)
         elif kind=='script':
             if len(value)<80:raise ValueError('Пришли сценарий минимум из пары предложений (80 символов).')
