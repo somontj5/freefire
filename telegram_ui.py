@@ -145,7 +145,7 @@ def callback(api,cq):
             rows=[[button({'all':'all — только сохранённые'}.get(value,value),f'v:{key}:{value}')] for value in PICKS.get(key,[])]
             rows += [[button('✏️ Своё значение','m:custom:'+key)], [button('↩️ Сбросить','r:'+key)],[button('⬅️ Настройки','m:settings')]]
             hint=''
-            if key=='GENSPARK_ACCOUNTS':hint='\nЧисло = сколько аккаунтов использовать. «all» — только уже сохранённые сессии и секреты, новых слотов не создаёт. Чтобы войти в новый аккаунт, укажи число больше текущего.'
+            if key=='GENSPARK_ACCOUNTS':hint='\nЕдинственное место управления аккаунтами. Число = сколько аккаунтов хочешь всего. Войти можно не во все: кнопка «Сохранить и остановить» фиксирует уже вошедшие, остальные — при следующем входе.'
             render(api,chat,mid,f'{LABELS.get(key,key)}\nСейчас: {config.get(key)}{hint}',rows)
         elif data.startswith('m:custom:'):ask_text(api,chat,mid,'setting',data.split(':',2)[2])
         elif data.startswith('v:'):
