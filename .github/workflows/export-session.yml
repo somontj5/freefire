@@ -1,12 +1,7 @@
 name: export-session
 
 'on':
-  workflow_dispatch:
-    inputs:
-      accounts:
-        description: "Сколько аккаунтов подключить (пусто = переменная репозитория)"
-        required: false
-        default: ""
+  workflow_dispatch: {}
 
 concurrency:
   group: browser-${{ github.ref_name }}
@@ -26,7 +21,8 @@ jobs:
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       TG_ADMIN_ID: ${{ secrets.TG_ADMIN_ID }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GENSPARK_ACCOUNTS: ${{ inputs.accounts || vars.GENSPARK_ACCOUNTS }}
+      # Количество аккаунтов задаётся ТОЛЬКО в Telegram (/параметр GENSPARK_ACCOUNTS N)
+      # и хранится в data/settings.json. Сюда сознательно не передаётся.
       GENSPARK_MANUAL_WAIT: ${{ vars.GENSPARK_MANUAL_WAIT }}
       GENSPARK_REMOTE: "1"
       GENSPARK_HEADLESS: "0"
