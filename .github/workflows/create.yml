@@ -11,10 +11,6 @@ name: create
         description: "Готовый сценарий (пусто = бот пишет сам)"
         required: false
         default: ""
-      accounts:
-        description: "Сколько аккаунтов в ротации (пусто = переменная репозитория)"
-        required: false
-        default: ""
 
 concurrency:
   group: browser-${{ github.ref_name }}
@@ -83,7 +79,8 @@ jobs:
       IMG2IMG_STRENGTH: ${{ vars.IMG2IMG_STRENGTH }}
       GENSPARK_REMOTE: "1"
       GENSPARK_HEADLESS: "0"
-      GENSPARK_ACCOUNTS: ${{ inputs.accounts || vars.GENSPARK_ACCOUNTS }}
+      # Количество аккаунтов задаётся ТОЛЬКО в Telegram (/параметр GENSPARK_ACCOUNTS N)
+      # и хранится в data/settings.json. Сюда сознательно не передаётся.
       GENSPARK_URL: ${{ vars.GENSPARK_URL }}
       GENSPARK_TIMEOUT: ${{ vars.GENSPARK_TIMEOUT }}
       GENSPARK_RETRIES: ${{ vars.GENSPARK_RETRIES }}
