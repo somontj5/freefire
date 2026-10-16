@@ -496,11 +496,19 @@ def animate(image_path,prompt,out_path=None):
 
 
 def login_accounts():
+    acc=accounts()
+    with_sessions=sum(1 for _,st in acc if st.get('cookies'))
+    log(f'Слотов аккаунтов: {len(acc)}; с сохранёнными сессиями: {with_sessions}; '
+        f'GENSPARK_ACCOUNTS={os.environ.get("GENSPARK_ACCOUNTS") or "(не задано — использован 1)"}. '
+        'Пустые слоты по очереди откроют браузер для ручного входа.')
     saved=[]
-    for name,st in accounts():
+    for name,st in acc:
         try:
             ctx=_context(name,st);pg=_ready(name,ctx,base_url())
-        except ManualRequired:raise
+        except ManualRequired as m:
+            # Вход — режим сбора сессий: пауза/таймаут означают «хватит», а не аварию.
+            log(f'{name}: ожидание прервано ({m}); сохраняю подтверждённые сессии и завершаю.')
+            break
         except Exception as e:
             log(f'{name}: вкладка не открылась ({type(e).__name__}); перехожу к следующему аккаунту.')
             continue
