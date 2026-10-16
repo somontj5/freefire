@@ -1,7 +1,12 @@
 name: export-session
 
 'on':
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      accounts:
+        description: "Сколько аккаунтов подключить (пусто = переменная репозитория)"
+        required: false
+        default: ""
 
 concurrency:
   group: browser-${{ github.ref_name }}
@@ -14,19 +19,30 @@ permissions:
 jobs:
   login:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 240
     env:
       DISPLAY: ":99"
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       TG_ADMIN_ID: ${{ secrets.TG_ADMIN_ID }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GENSPARK_ACCOUNTS: ${{ vars.GENSPARK_ACCOUNTS }}
+      GENSPARK_ACCOUNTS: ${{ inputs.accounts || vars.GENSPARK_ACCOUNTS }}
       GENSPARK_MANUAL_WAIT: ${{ vars.GENSPARK_MANUAL_WAIT }}
       GENSPARK_REMOTE: "1"
       GENSPARK_HEADLESS: "0"
       SESSION_BACKUP_KEY: ${{ secrets.SESSION_BACKUP_KEY }}
       REMOTE_DESKTOP_PASSWORD: ${{ secrets.REMOTE_DESKTOP_PASSWORD }}
+      GENSPARK_STORAGES: ${{ secrets.GENSPARK_STORAGES }}
+      GENSPARK_STORAGE_1: ${{ secrets.GENSPARK_STORAGE_1 }}
+      GENSPARK_STORAGE_2: ${{ secrets.GENSPARK_STORAGE_2 }}
+      GENSPARK_STORAGE_3: ${{ secrets.GENSPARK_STORAGE_3 }}
+      GENSPARK_STORAGE_4: ${{ secrets.GENSPARK_STORAGE_4 }}
+      GENSPARK_STORAGE_5: ${{ secrets.GENSPARK_STORAGE_5 }}
+      GENSPARK_STORAGE_6: ${{ secrets.GENSPARK_STORAGE_6 }}
+      GENSPARK_STORAGE_7: ${{ secrets.GENSPARK_STORAGE_7 }}
+      GENSPARK_STORAGE_8: ${{ secrets.GENSPARK_STORAGE_8 }}
+      GENSPARK_STORAGE_9: ${{ secrets.GENSPARK_STORAGE_9 }}
+      GENSPARK_STORAGE_10: ${{ secrets.GENSPARK_STORAGE_10 }}
     steps:
       - uses: actions/checkout@v4
         with:
