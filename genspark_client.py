@@ -24,6 +24,9 @@ INPUT_SELECTORS=["textarea[name='query']",'.j-search-input','textarea','[content
 ANSWER_SELECTORS=['[data-message-role=assistant]','[data-role=assistant]',"[data-testid='chat-answer']",'.markdown-body','.markdown-prose','.prose']
 
 class ManualRequired(RuntimeError):pass
+class UserStopped(ManualRequired):pass # Мягкий стоп от пользователя: сохранить и не продолжать.
+class WaitTimeout(ManualRequired):pass # Время ручного подтверждения истекло — пользователь не успел.
+class PageDead(ManualRequired):pass # Страница аккаунта не открылась — виним слот, а не весь прогон.
 class AccountUnavailable(RuntimeError):pass
 class BrowserLayoutError(RuntimeError):pass
 class BudgetMismatch(RuntimeError):pass
@@ -98,7 +101,14 @@ def accounts_all():
 def accounts_count():
     v=os.environ.get('GENSPARK_ACCOUNTS') or '1'
     return len(accounts_all()) if v in ('all','0') else max(1,int(v))
-def accounts():return accounts_all()[:accounts_count()]
+def accounts():
+    acc=accounts_all()[:accounts_count()]
+    if os.environ.get('GENSPARK_TASK')=='create':
+        # В сборке участвуют только вошедшие аккаунты: «30 слотов, вошли в 3» — ротация крутит эти 3,
+        # а пустые слоты не требуют входа посреди генерации. Вход (TASK=login) видит все слоты.
+        live=[(n,st) for n,st in acc if st.get('cookies')]
+        if live:acc=live
+    return acc
 
 
 def _sanitize_cookie(c):
@@ -275,10 +285,10 @@ def human(message,on_tick=None):
         d=read(PRIVATE/'approval.json')
         if d.get('id')==rid:
             atomic(PRIVATE/'request.json',{'message':'Действие принято'})
-            if d.get('action')=='pause':raise ManualRequired('Ты остановил задачу; прогресс сохранён.')
+            if d.get('action')=='pause':raise UserStopped('Ты остановил задачу; прогресс сохранён.')
             return
         time.sleep(.5)
-    raise ManualRequired('Время ручного подтверждения истекло; прогресс сохранён.')
+    raise WaitTimeout('Время ручного подтверждения истекло; прогресс сохранён.')
 
 
 def _ready(name,ctx,url):
@@ -299,14 +309,15 @@ def _ready(name,ctx,url):
             continue
         if challenge(pg) or _login_visible(pg):
             pg.bring_to_front()
+            hint='\nХватит аккаунтов — жми «Сохранить и остановить»: уже вошедшие сохранятся.' if os.environ.get('GENSPARK_TASK')=='login' else ''
             while True:
-                human(f'{name}: пройди проверку Cloudflare и войди в Genspark вручную. Затем нажми «Выполнено».')
+                human(f'{name}: пройди проверку Cloudflare и войди в Genspark вручную. Затем нажми «Выполнено».{hint}')
                 pg.wait_for_timeout(1000)
                 if not challenge(pg) and not _login_visible(pg):break
                 log(f'{name}: вход ещё не завершён; открой экран снова и продолжай — задача не падает.')
         _persist(name,ctx)
         return pg
-    raise ManualRequired('Страница Genspark не открылась после двух попыток; прогресс сохранён.')
+    raise PageDead('Страница Genspark не открылась после двух попыток; прогресс сохранён.')
 
 
 def _answer_text(page):
@@ -499,21 +510,44 @@ def login_accounts():
     acc=accounts()
     with_sessions=sum(1 for _,st in acc if st.get('cookies'))
     log(f'Слотов аккаунтов: {len(acc)}; с сохранёнными сессиями: {with_sessions}; '
-        f'GENSPARK_ACCOUNTS={os.environ.get("GENSPARK_ACCOUNTS") or "(не задано — использован 1)"}. '
-        'Пустые слоты по очереди откроют браузер для ручного входа.')
-    saved=[]
+        f'GENSPARK_ACCOUNTS={os.environ.get("GENSPARK_ACCOUNTS") or "(не задано — использован 1)"} '
+        '(значение приходит из Telegram, data/settings.json). '
+        'Пустые слоты по очереди откроют браузер для ручного входа; остановиться можно в любой момент.')
+    saved=[];failed=[];stop_note='';requested=len(acc);no_reply=0
     for name,st in acc:
-        try:
-            ctx=_context(name,st);pg=_ready(name,ctx,base_url())
-        except ManualRequired as m:
-            # Вход — режим сбора сессий: пауза/таймаут означают «хватит», а не аварию.
-            log(f'{name}: ожидание прервано ({m}); сохраняю подтверждённые сессии и завершаю.')
+        got=None;reason='';user_stopped=False
+        for attempt in range(1,retries_n()+2):
+            try:
+                ctx=_context(name,st);pg=_ready(name,ctx,base_url());got=(ctx,pg);break
+            except UserStopped:
+                user_stopped=True;break
+            except (PageDead,WaitTimeout) as m:
+                reason=str(m);break
+            except Exception as e:
+                reason=type(e).__name__
+                log(f'{name}: вкладка не открылась ({reason}); попытка {attempt}/{retries_n()+1}.')
+        if got:
+            _persist(name,got[0]);saved.append(name);no_reply=0
+            log(f'{name}: сессия жива и сохранена.')
+        elif user_stopped:
+            stop_note=f'Остановились на {name} по твоей кнопке. Уже вошедшие сохранены.'
+            log(stop_note)
             break
-        except Exception as e:
-            log(f'{name}: вкладка не открылась ({type(e).__name__}); перехожу к следующему аккаунту.')
-            continue
-        _persist(name,ctx);saved.append(name)
-        log(f'{name}: сессия жива и сохранена.')
+        else:
+            failed.append((name,reason or 'неизвестная ошибка'))
+            log(f'{name}: {reason or "не удалось"}; перехожу к следующему аккаунту.')
+            if not st.get('cookies') and reason.startswith('Время ручного'):
+                no_reply+=1
+                if no_reply>=2:
+                    stop_note=(f'Два подтверждения подряд остались без ответа — остановился на {name}, '
+                               'чтобы не жечь время runner. Продолжить — снова «Вход в аккаунты»: вошедшие пропустятся автоматически.')
+                    log(stop_note)
+                    break
+    report=f'🔐 Вход: слотов {requested}, сохранено сессий {len(saved)}.'
+    if failed:report+='\nНе удалось: '+'; '.join(f'{n} — {r}' for n,r in failed)+'.'
+    if stop_note:report+='\n'+stop_note
+    elif failed:report+='\nЧтобы добрать недошедшие — снова «Вход в аккаунты»: вошедшие пропустятся автоматически.'
+    log(report);notify(report)
     print('Сессии сохранены приватно; резерв будет зашифрован. Сами значения не выводятся.')
     if not saved:raise ManualRequired('Ни одна сессия не сохранена; смотри логи выше.')
 
