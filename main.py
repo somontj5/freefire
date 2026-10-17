@@ -478,7 +478,7 @@ def genspark_search(prompt):
         if isinstance(e, QuotaPause):
             raise
         if ENV('GENSPARK_ALLOW_FALLBACK','0') != '1':
-            raise QuotaPause(f'Genspark требует внимания ({type(e).__name__}). Подробности в серверном браузере.') from None
+            raise QuotaPause(f'Genspark требует внимания: {e}') from None
         return None
 
 
@@ -491,7 +491,7 @@ def smart_json(prompt,models=None):
             if isinstance(e, QuotaPause):
                 raise
             if ENV('GENSPARK_ALLOW_FALLBACK','0') != '1':
-                raise QuotaPause(f'Запрос Genspark приостановлен ({type(e).__name__})') from None
+                raise QuotaPause(f'Запрос Genspark приостановлен: {e}') from None
             log('Разрешённый запасной путь: Gemini')
     return gemini(prompt,models=models)
 
@@ -3251,14 +3251,14 @@ def cmd_create():
         final = WORK / "final.mp4"
         if story_mode and img_fail:
             notify(f"⚠️ Не удалось нарисовать картинок: {img_fail}. Вместо них использованы соседние кадры.")
-        if story_mode and config.get('GENSPARK_FINAL_EDITOR')=='genspark' and not OFFLINE:
+        if story_mode and (ENV('GENSPARK_FINAL_EDITOR') or config.DEFAULTS['GENSPARK_FINAL_EDITOR'])=='genspark' and not OFFLINE:
             import editor_client
             ck_put(vid,story=story,facts=facts,sources=sources,claims=claim_issues,status='running')
             try:
                 edited=editor_client.edit(JOBS/vid,story,audios,durs)
                 shutil.copyfile(edited,final)
             except Exception as e:
-                raise QuotaPause(f'Финальный монтаж приостановлен ({type(e).__name__}); задача и материалы сохранены') from None
+                raise QuotaPause(f'Финальный монтаж приостановлен ({e}); задача и материалы сохранены') from None
         else:
             if story_mode:
                 sfx_track = None
@@ -3413,6 +3413,9 @@ def handle_message(m):
         return
     cmd = text.split()[0].split("@")[0].lower() if text else ""
     import telegram_ui
+    if telegram_ui.job_active() and cmd in ('/make','/тема','/tema','/topic'):
+        telegram_ui.busy(sys.modules[__name__],chat,None)
+        return
     if telegram_ui.text(sys.modules[__name__],m):
         return
     if cmd in ("/start", "/help", "/menu", "/меню"):
