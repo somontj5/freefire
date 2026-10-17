@@ -108,6 +108,8 @@ def accounts():
         # а пустые слоты не требуют входа посреди генерации. Вход (TASK=login) видит все слоты.
         live=[(n,st) for n,st in acc if st.get('cookies')]
         if live:acc=live
+        elif acc:raise ManualRequired('Ни один аккаунт не вошёл (все слоты пустые — restore не вернул сессии). '
+                                        'Запусти «Вход в аккаунты» и войди хотя бы в один.')
     return acc
 
 
@@ -354,15 +356,23 @@ def _chat_one(name,storage,prompt,shots_dir=None):
         atomic(taskpath,{'account':name,'url':pg.url,'status':'submitted'})
         # Send exactly once. No duplicate Enter, no silent 8000-character truncation.
         inp.press('Enter')
-    end=time.monotonic()+timeout_s();last='';stable=0
+        log(f'{name}: запрос отправлен; жду ответ до {timeout_s()} с.')
+    end=time.monotonic()+timeout_s();last='';stable=0;next_beat=time.monotonic()+60
     while time.monotonic()<end:
         pg.wait_for_timeout(1000)
         page=ctx.pages[-1]
         atomic(taskpath,{'account':name,'url':page.url,'status':'submitted'})
+        if time.monotonic()>=next_beat:
+            log(f'{name}: ответ генерируется ({int(timeout_s()-(end-time.monotonic()))}/{timeout_s()} с)...')
+            next_beat=time.monotonic()+60
         if quota(page):
             taskpath.unlink(missing_ok=True)
             raise AccountUnavailable('На этом аккаунте недостаточно кредитов')
-        if challenge(page):raise ManualRequired('Проверка появилась во время ответа; приостановлено')
+        if challenge(page):
+            # Проверка посреди ответа: даём кнопки, а не молчаливую паузу.
+            pg.bring_to_front()
+            human(f'{name}: появилась проверка Cloudflare во время ответа. Пройди её в серверном браузере, затем «Выполнено» — ответ продолжит собираться.')
+            if challenge(page):raise ManualRequired('Проверка не пройдена; прогресс сохранён')
         cur=_answer_text(page)
         busy=page.locator('[aria-busy=true]').count()>0 or page.get_by_role('button',name=re.compile('Stop|Остановить')).count()>0
         if cur and cur!=before:
@@ -372,7 +382,8 @@ def _chat_one(name,storage,prompt,shots_dir=None):
                 _persist(name,ctx)
                 for old in ctx.pages[:-1]:old.close()
                 return cur
-    raise ManualRequired('Ответ не завершился. Не посылаю платный запрос повторно автоматически.')
+    raise ManualRequired(f'Ответ не завершился за {timeout_s()} с. Если ответ большой — подними лимит: '
+                         '/параметр GENSPARK_TIMEOUT 900, затем снова /make. Прогресс сохранён, запрос повторно не отправляется.')
 
 
 def _parse_json(text):
