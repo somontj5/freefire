@@ -27,6 +27,7 @@ class ManualRequired(RuntimeError):pass
 class UserStopped(ManualRequired):pass # Мягкий стоп от пользователя: сохранить и не продолжать.
 class WaitTimeout(ManualRequired):pass # Время ручного подтверждения истекло — пользователь не успел.
 class PageDead(ManualRequired):pass # Страница аккаунта не открылась — виним слот, а не весь прогон.
+class AnswerTimeout(ManualRequired):pass # Ответ не пришёл за лимит времени. Это НЕ запрос подтверждения.
 class AccountUnavailable(RuntimeError):pass
 class BrowserLayoutError(RuntimeError):pass
 class BudgetMismatch(RuntimeError):pass
@@ -358,6 +359,7 @@ def _chat_one(name,storage,prompt,shots_dir=None):
         inp.press('Enter')
         log(f'{name}: запрос отправлен; жду ответ до {timeout_s()} с.')
     end=time.monotonic()+timeout_s();last='';stable=0;next_beat=time.monotonic()+60
+    seen=0;busy=False
     while time.monotonic()<end:
         pg.wait_for_timeout(1000)
         page=ctx.pages[-1]
@@ -374,6 +376,7 @@ def _chat_one(name,storage,prompt,shots_dir=None):
             human(f'{name}: появилась проверка Cloudflare во время ответа. Пройди её в серверном браузере, затем «Выполнено» — ответ продолжит собираться.')
             if challenge(page):raise ManualRequired('Проверка не пройдена; прогресс сохранён')
         cur=_answer_text(page)
+        seen=max(seen,len(cur))
         busy=page.locator('[aria-busy=true]').count()>0 or page.get_by_role('button',name=re.compile('Stop|Остановить')).count()>0
         if cur and cur!=before:
             stable=stable+1 if cur==last and not busy else 0;last=cur
@@ -382,8 +385,13 @@ def _chat_one(name,storage,prompt,shots_dir=None):
                 _persist(name,ctx)
                 for old in ctx.pages[:-1]:old.close()
                 return cur
-    raise ManualRequired(f'Ответ не завершился за {timeout_s()} с. Если ответ большой — подними лимит: '
-                         '/параметр GENSPARK_TIMEOUT 900, затем снова /make. Прогресс сохранён, запрос повторно не отправляется.')
+    suggested=min(1800,timeout_s()*2)
+    hint=(f'Подними лимит: /параметр GENSPARK_TIMEOUT {suggested} и снова /make.'
+          if suggested>timeout_s() else
+          'Лимит уже максимальный (1800 с). Если активности генерации не видно — пришли свежий лог шага Create video.')
+    state_word='генерация ещё идёт' if busy else 'активности генерации не видно'
+    raise AnswerTimeout(f'Ответ не пришёл за {timeout_s()} с (видел текст: {seen} симв., {state_word}). {hint} '
+                        'Прогресс сохранён, запрос повторно не отправляется.')
 
 
 def _parse_json(text):
