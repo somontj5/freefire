@@ -475,8 +475,7 @@ def genspark_search(prompt):
     try:
         return genspark_client.chat(prompt,as_json=False,search=True)
     except Exception as e:
-        if isinstance(e, QuotaPause):
-            raise
+        if isinstance(e,(QuotaPause,genspark_client.AnswerTimeout)):raise
         if ENV('GENSPARK_ALLOW_FALLBACK','0') != '1':
             raise QuotaPause(f'Genspark требует внимания: {e}') from None
         return None
@@ -488,8 +487,7 @@ def smart_json(prompt,models=None):
         try:
             return genspark_client.chat(prompt,as_json=True)
         except Exception as e:
-            if isinstance(e, QuotaPause):
-                raise
+            if isinstance(e,(QuotaPause,genspark_client.AnswerTimeout)):raise
             if ENV('GENSPARK_ALLOW_FALLBACK','0') != '1':
                 raise QuotaPause(f'Запрос Genspark приостановлен: {e}') from None
             log('Разрешённый запасной путь: Gemini')
@@ -2985,6 +2983,7 @@ def build_script_prompt(facts, cast):
 
 
 def cmd_create():
+    import genspark_client
     WORK.mkdir(exist_ok=True)
     vid = pick_resume() or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
     os.environ["GENSPARK_JOB_ID"]=vid
@@ -3296,13 +3295,19 @@ def cmd_create():
     except NoStory as e:
         notify(f"🔎 {e}")
         return
+    except genspark_client.AnswerTimeout as e:
+        # Тайм-аут — НЕ запрос подтверждения: никаких кнопок, отдельная формулировка.
+        ck_put(vid, story=story, facts=facts, sources=sources, claims=claim_issues, status="paused")
+        log("тайм-аут ответа Genspark: пауза до следующего запуска")
+        notify(f"⏱ Тайм-аут: {str(e)[:380]} Job {vid} сохранён; /make продолжит без повторной отправки.")
+        return
     except QuotaPause as e:
         # Лимиты всех задействованных аккаунтов genspark.ai исчерпаны. Всё доснятое уже лежит
         # в data/jobs/<id>/ и уйдёт в git шагом «Save data»; следующий запуск продолжит сам.
         ck_put(vid, story=story, facts=facts, sources=sources, claims=claim_issues, status="paused")
         done_n = sum(1 for s in CK["scenes"].values() if s.get("done"))
         log("job встал на паузу до следующего запуска")
-        notify(f"⏸ Требуется внимание: {str(e)[:140]}. Прогресс сохранён (job {vid}). "
+        notify(f"⏸ Требуется внимание: {str(e)[:380]}. Прогресс сохранён (job {vid}). "
                "Следующий /make продолжит, если не задан новый сценарий. Не запускай генерацию дубля.")
         return
     except Exception as e:
