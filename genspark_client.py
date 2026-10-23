@@ -538,6 +538,28 @@ def inspect_video(path):
     return d
 
 
+def _attach(pg,image):
+    # Genspark 6.0: скрытого input[type=file] на главной нет. Фото прикрепляется так:
+    # «+» (.add-entry-btn, aria-label «Добавить файлы и другое») → «Просмотреть локальные файлы» → системный диалог.
+    fi=pg.locator('input[type=file]')
+    if fi.count():
+        fi.first.set_input_files(str(image));return True
+    plus=_first(pg,['.add-entry-btn',"[aria-label='Добавить файлы и другое']","[aria-label*='Add files' i]"],5000)
+    if plus is None:return False
+    plus.click();pg.wait_for_timeout(600)
+    item=pg.locator('.add-entry-option-item').filter(has_text=re.compile('локальн|local|загруз|upload',re.I)).first
+    if not item.count():return False
+    try:
+        with pg.expect_file_chooser(timeout=10000) as fc:item.click()
+        fc.value.set_files(str(image))
+    except Exception:
+        fi=pg.locator('input[type=file]') # на случай, если клик лишь добавил input в DOM
+        if not fi.count():return False
+        fi.first.set_input_files(str(image))
+    pg.wait_for_timeout(3000) # дать файлу загрузиться до отправки
+    return True
+
+
 def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
     # Manual UI selection is intentional: home-page HTML does NOT establish video generator selectors.
     ctx=_context(name,storage)
@@ -554,21 +576,21 @@ def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
                   'Если указанные параметры недоступны, остановись и сообщи, не трать кредиты. '
                   f'Движение: {prompt}')
     if mode=='agent' and not pending:
-        fi=pg.locator('input[type=file]').first
-        if not fi.count():
-            raise ManualRequired('На главном экране не найден приёмник фото. Требуется один раз показать реальный UI прикрепления.')
-        fi.set_input_files(str(image))
-        pg.wait_for_timeout(1500)
+        if not _attach(pg,image):
+            _diagnose(pg,name,'не удалось прикрепить фото через «+» → «Просмотреть локальные файлы»')
+            taskpath.unlink(missing_ok=True)
+            raise ManualRequired('Не удалось прикрепить фото («+» → «Просмотреть локальные файлы»). Скриншот отправлен; кредиты не потрачены.')
         inp=_first(pg,INPUT_SELECTORS)
         if inp is None:raise BrowserLayoutError('Не найдено поле агента')
         inp.fill(instructions)
         atomic(taskpath,{'account':name,'url':pg.url,'status':'submitted'})
-        inp.press('Enter') # exactly one submission, no expensive automatic retries
+        _submit(pg,inp) # exactly one submission, no expensive automatic retries
     elif mode=='agent' and pending.get('status')=='submitted':
         pass # task already sent: wait, don't submit twice
     else:
-        fi=pg.locator('input[type=file]').first
-        if fi.count() and not pending:fi.set_input_files(str(image))
+        if not pending:
+            try:_attach(pg,image)
+            except Exception:pass
         inp=_first(pg,INPUT_SELECTORS,2000)
         if inp is not None and not pending:inp.fill(instructions)
         human(f'{name}: видео. Задание заполнено на главном экране: {instructions}\n'
