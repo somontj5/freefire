@@ -539,7 +539,9 @@ def inspect_video(path):
     duration=float(d['format'].get('duration',v.get('duration',0)))
     if duration<=0:raise BudgetMismatch('Видео пустое')
     if abs(duration-anim_duration_s())>.35 or min(v['width'],v['height'])!=int(anim_quality()[:-1]):
-        raise BudgetMismatch('Скачанный клип не соответствует выбранной длительности/разрешению. Сохранён, повтор не запускается.')
+        # Клип уже оплачен: монтаж сам подгонит длину (цикл/обрезка) и масштаб. Не останавливаемся и не перегенерируем.
+        log(f"Клип {duration:.1f} с, {v['width']}x{v['height']} отличается от заказа "
+            f"({anim_duration_s()} с, {anim_quality()}); использую как есть, повтор не запускаю.")
     return d
 
 

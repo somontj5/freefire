@@ -136,7 +136,7 @@ class LogicTests(unittest.TestCase):
         subprocess.run(['ffmpeg','-y','-f','lavfi','-i','color=c=blue:s=480x854:r=24:d=3',
                         '-c:v','libx264','-preset','ultrafast',str(p)],check=True,capture_output=True)
         self.assertTrue(gc.inspect_video(p))
-        with patch.dict(os.environ,{'GENSPARK_ANIM_DURATION':'4'}),self.assertRaises(gc.BudgetMismatch):gc.inspect_video(p)
+        with patch.dict(os.environ,{'GENSPARK_ANIM_DURATION':'4'}):self.assertTrue(gc.inspect_video(p))  # несовпадение не блокирует оплаченный клип
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
