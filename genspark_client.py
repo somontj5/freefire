@@ -546,25 +546,64 @@ def inspect_video(path):
 
 
 def _attach(pg,image):
-    # Genspark 6.0: скрытого input[type=file] на главной нет. Фото прикрепляется так:
-    # «+» (.add-entry-btn, aria-label «Добавить файлы и другое») → «Просмотреть локальные файлы» → системный диалог.
-    fi=pg.locator('input[type=file]')
-    if fi.count():
-        fi.first.set_input_files(str(image));return True
-    plus=_first(pg,['.add-entry-btn',"[aria-label='Добавить файлы и другое']","[aria-label*='Add files' i]"],5000)
-    if plus is None:return False
-    plus.click();pg.wait_for_timeout(600)
-    item=pg.locator('.add-entry-option-item').filter(has_text=re.compile('локальн|local|загруз|upload',re.I)).first
-    if not item.count():return False
-    try:
-        with pg.expect_file_chooser(timeout=10000) as fc:item.click()
-        fc.value.set_files(str(image))
-    except Exception:
-        fi=pg.locator('input[type=file]') # на случай, если клик лишь добавил input в DOM
-        if not fi.count():return False
-        fi.first.set_input_files(str(image))
-    pg.wait_for_timeout(3000) # дать файлу загрузиться до отправки
-    return True
+    # Genspark 6.0: «+» (aria-label «Добавить файлы и другое») → меню → «Просмотреть локальные файлы» → диалог.
+    # Разметка меню меняется, поэтому несколько бесплатных способов подряд (ничего не отправляется, кредиты не тратятся).
+    image=str(image)
+    def via_input():
+        fi=pg.locator('input[type=file]')
+        if fi.count():
+            fi.last.set_input_files(image);pg.wait_for_timeout(3000);return True
+        return False
+    def click_chooser(el,timeout=6000):
+        try:
+            with pg.expect_file_chooser(timeout=timeout) as fc:el.click()
+            fc.value.set_files(image);pg.wait_for_timeout(3000);return True
+        except Exception:return False
+    if via_input():return True
+    plus=_first(pg,['.add-entry-btn',"[aria-label='Добавить файлы и другое']","[aria-label*='Добавить файлы' i]",
+                    "[aria-label*='Add files' i]","[aria-label*='attach' i]"],5000)
+    if plus is not None:
+        # 1) «+» сам может открыть диалог; 2) иначе открылось меню — ищем пункт по тексту.
+        if click_chooser(plus,3000):return True
+        if via_input():return True
+        rx=re.compile('локальн|с компьютера|с устройства|загруз|файл|local|upload|computer|device|browse',re.I)
+        for _ in range(2):
+            pg.wait_for_timeout(800)
+            items=[]
+            for sel in ['.add-entry-option-item','[role=menuitem]','[role=option]','li','[class*=option]','[class*=item]','button','div']:
+                try:
+                    for el in pg.locator(sel).filter(has_text=rx).all()[-15:]:
+                        try:
+                            if el.is_visible() and len(el.inner_text(timeout=500))<60:items.append(el)
+                        except Exception:pass
+                except Exception:pass
+                if items:break
+            try:log('меню «+»: '+' | '.join(t.strip() for t in pg.locator('[role=menu],[class*=popover],[class*=dropdown],[class*=option]').all_inner_texts() if t.strip())[:300])
+            except Exception:pass
+            for el in items:
+                if click_chooser(el):return True
+                if via_input():return True
+            if not items:
+                try:plus.click()
+                except Exception:pass
+    # Запасной путь: вставка картинки из буфера (paste) и drop прямо в поле ввода.
+    inp=_first(pg,INPUT_SELECTORS,2000)
+    if inp is None:return False
+    data=base64.b64encode(Path(image).read_bytes()).decode()
+    inp.evaluate('''(el,[b64,name]) => { const bin=atob(b64),u=new Uint8Array(bin.length);
+        for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);
+        const f=new File([u],name,{type:'image/png'}),dt=new DataTransfer();dt.items.add(f);el.focus();
+        el.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));
+        return true;}''',[data,Path(image).name])
+    pg.wait_for_timeout(3000)
+    if pg.locator('img[src^="blob:"],img[src^="data:"],[class*=attach] img,[class*=file] img,[class*=upload] img').count():return True
+    inp.evaluate('''(el,[b64,name]) => { const bin=atob(b64),u=new Uint8Array(bin.length);
+        for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);
+        const f=new File([u],name,{type:'image/png'}),dt=new DataTransfer();dt.items.add(f);
+        for(const t of ['dragenter','dragover','drop'])el.dispatchEvent(new DragEvent(t,{dataTransfer:dt,bubbles:true,cancelable:true}));
+        return true;}''',[data,Path(image).name])
+    pg.wait_for_timeout(3000)
+    return bool(pg.locator('img[src^="blob:"],img[src^="data:"],[class*=attach] img,[class*=file] img,[class*=upload] img').count())
 
 
 def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
