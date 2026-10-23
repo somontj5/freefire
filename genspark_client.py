@@ -21,7 +21,26 @@ SESSIONS=PRIVATE/'sessions'
 _state={'next':0,'blocked':set()}
 _pool={};_pw=None
 INPUT_SELECTORS=["textarea[name='query']",'.j-search-input','textarea','[contenteditable=true]']
-ANSWER_SELECTORS=['[data-message-role=assistant]','[data-role=assistant]',"[data-testid='chat-answer']",'.markdown-body','.markdown-prose','.prose']
+ANSWER_SELECTORS=['[data-message-role=assistant]','[data-role=assistant]',"[data-testid='chat-answer']",'.markdown-body','.markdown-prose','.prose',
+                  "[class*='markdown']",'.message-content','.chat-message-content','.chat-answer']
+SEND_SELECTORS=["button[type='submit']","[aria-label*='send' i]","[aria-label*='отправ' i]",'.j-send-btn',
+                "[class*='send' i][role='button']","[class*='send' i]:is(button,div,span)"]
+DIAG=Path(__file__).resolve().parent/'work'/'diag'
+# Запасной поиск ответа, если Genspark поменял разметку: берём последний «блок сообщения»,
+# поднимаемся к самому внешнему такому блоку, который НЕ содержит наш промпт (это эхо пользователя).
+_GENERIC_ANSWER_JS='''(head) => {
+  const rx=/markdown|answer|assistant|message|bubble|response|reply|prose|content/i;
+  const norm=s=>(s||'').replace(/\\s+/g,' ').trim();
+  const bad=el=>el.closest('nav,aside,header,footer,form,textarea,[contenteditable=true]')||el.querySelector('textarea,input,[contenteditable=true]');
+  const ok=el=>{const c=(typeof el.className==='string'?el.className:'')+' '+(el.getAttribute('data-testid')||'')+' '+(el.getAttribute('data-role')||'');
+    if(!rx.test(c)||bad(el))return false; const r=el.getBoundingClientRect(); if(!r.width||!r.height)return false;
+    const t=norm(el.innerText); return t.length>1 && !(head && t.includes(head));};
+  const all=Array.from(document.querySelectorAll('body *')).filter(ok);
+  if(!all.length)return '';
+  let cur=all[all.length-1];
+  for(let p=cur.parentElement;p&&p!==document.body;p=p.parentElement){ if(ok(p))cur=p; }
+  return (cur.innerText||'').trim();
+}'''
 
 class ManualRequired(RuntimeError):pass
 class UserStopped(ManualRequired):pass # Мягкий стоп от пользователя: сохранить и не продолжать.
@@ -323,16 +342,76 @@ def _ready(name,ctx,url):
     raise PageDead('Страница Genspark не открылась после двух попыток; прогресс сохранён.')
 
 
-def _answer_text(page):
+def _prompt_head(prompt):
+    # Начало промпта без префикса: по нему отличаем эхо нашего сообщения от ответа ассистента.
+    body=prompt.split('\n',1)[1] if prompt.startswith('Текстовый этап') and '\n' in prompt else prompt
+    return ' '.join(body.split())[:60]
+
+
+def _answer_text(page,head=''):
     override=os.environ.get('GENSPARK_ANSWER_SELECTOR')
     selectors=[override] if override else ANSWER_SELECTORS
     for sel in selectors:
-        els=page.locator(sel).all()
+        try:els=page.locator(sel).all()
+        except Exception:continue
         for e in reversed(els):
-            if e.is_visible():
-                t=e.inner_text().strip()
-                if t:return t
-    return ''
+            try:
+                if not e.is_visible():continue
+                t=e.inner_text(timeout=2000).strip()
+            except Exception:continue
+            if t and not (head and head in ' '.join(t.split())):return t
+    if override:return ''
+    try:return (page.evaluate(_GENERIC_ANSWER_JS,head) or '').strip()
+    except Exception:return ''
+
+
+def _input_value(el):
+    try:return el.evaluate("el => (el.value ?? el.innerText ?? '').trim()")
+    except Exception:return '' # поле исчезло — значит, страница ушла в диалог
+
+
+def _submit(pg,inp):
+    # Enter один раз. Если через 8 с текст всё ещё в поле и URL не сменился — запрос НЕ ушёл,
+    # тогда (и только тогда) жмём кнопку отправки. Дубля не будет: отправленный запрос очищает поле.
+    url0=pg.url;inp.press('Enter')
+    for _ in range(16):
+        pg.wait_for_timeout(500)
+        if pg.url!=url0 or not _input_value(inp):return True
+    btn=_first(pg,SEND_SELECTORS,2000)
+    if btn is not None:
+        log('Enter не отправил запрос; нажимаю кнопку отправки.')
+        try:btn.click()
+        except Exception:pass
+        for _ in range(16):
+            pg.wait_for_timeout(500)
+            if pg.url!=url0 or not _input_value(inp):return True
+    return False
+
+
+def _diagnose(page,name,reason):
+    # Скриншот + текст + HTML страницы в work/diag и фото в Telegram: видно, что реально показал Genspark.
+    DIAG.mkdir(parents=True,exist_ok=True);stamp=time.strftime('%Y%m%d-%H%M%S')
+    shot=DIAG/f'{name}-{stamp}.png'
+    try:page.screenshot(path=str(shot),full_page=False)
+    except Exception:shot=None
+    try:(DIAG/f'{name}-{stamp}.txt').write_text(page.locator('body').inner_text(timeout=5000)[:30000],encoding='utf8')
+    except Exception:pass
+    try:(DIAG/f'{name}-{stamp}.html').write_text(page.content()[:2_000_000],encoding='utf8')
+    except Exception:pass
+    try:
+        classes=page.evaluate('''() => {const m={};document.querySelectorAll('body *').forEach(e=>{
+          if(typeof e.className!=='string')return; e.className.split(/\\s+/).forEach(c=>{if(c&&/markdown|answer|assist|message|bubble|response|reply|prose|chat/i.test(c))m[c]=(m[c]||0)+1;});});
+          return Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0,25).map(([k,v])=>k+':'+v).join(' ');}''')
+        log(f'{name}: диагностика — URL {page.url[:120]}; классы-кандидаты: {classes or "нет"}')
+    except Exception:pass
+    if shot and os.environ.get('TG_TOKEN') and os.environ.get('TG_CHAT_ID'):
+        import requests
+        try:
+            with open(shot,'rb') as f:
+                requests.post('https://api.telegram.org/bot'+os.environ['TG_TOKEN']+'/sendPhoto',
+                              data={'chat_id':os.environ['TG_CHAT_ID'],'caption':f'🔍 {name}: {reason}'[:1000]},
+                              files={'photo':f},timeout=30)
+        except Exception:log('Скриншот диагностики не отправился в Telegram; он лежит в work/diag.')
 
 
 def _text_task_path(prompt):
@@ -346,6 +425,7 @@ def _chat_one(name,storage,prompt,shots_dir=None):
     if pending.get('status')=='complete':return pending['reply']
     if pending.get('account') not in (None,name):raise ManualRequired('Текстовый запрос уже отправлен другим аккаунтом; не создаю дубль')
     ctx=_context(name,storage); pg=_ready(name,ctx,pending.get('url') or base_url())
+    head=_prompt_head(prompt)
     if pending:
         before=''
         human(f'{name}: продолжение уже отправленного текстового запроса. Дождись ответа в серверном браузере, затем «Выполнено». '
@@ -353,11 +433,16 @@ def _chat_one(name,storage,prompt,shots_dir=None):
     else:
         inp=_first(pg,[os.environ['GENSPARK_INPUT_SELECTOR']] if os.environ.get('GENSPARK_INPUT_SELECTOR') else INPUT_SELECTORS)
         if inp is None:raise BrowserLayoutError('Не найдено поле чата после входа. Нужна проверка UI, не повтор генерации.')
-        before=_answer_text(pg);inp.fill(prompt)
+        before=_answer_text(pg,head);inp.fill(prompt)
         atomic(taskpath,{'account':name,'url':pg.url,'status':'submitted'})
         # Send exactly once. No duplicate Enter, no silent 8000-character truncation.
-        inp.press('Enter')
-        log(f'{name}: запрос отправлен; жду ответ до {timeout_s()} с.')
+        if _submit(pg,inp):log(f'{name}: запрос отправлен; жду ответ до {timeout_s()} с.')
+        else:
+            # Запрос так и не ушёл — денег не потрачено, можно честно сбросить задачу и сказать почему.
+            _diagnose(pg,name,'запрос не отправился: текст остался в поле ввода')
+            taskpath.unlink(missing_ok=True)
+            raise BrowserLayoutError('Запрос не отправился: ни Enter, ни кнопка отправки не сработали. '
+                                     'Скриншот отправлен; проверь UI Genspark (поле ввода/кнопку).')
     end=time.monotonic()+timeout_s();last='';stable=0;next_beat=time.monotonic()+60
     seen=0;busy=False
     while time.monotonic()<end:
@@ -365,7 +450,8 @@ def _chat_one(name,storage,prompt,shots_dir=None):
         page=ctx.pages[-1]
         atomic(taskpath,{'account':name,'url':page.url,'status':'submitted'})
         if time.monotonic()>=next_beat:
-            log(f'{name}: ответ генерируется ({int(timeout_s()-(end-time.monotonic()))}/{timeout_s()} с)...')
+            log(f'{name}: ответ генерируется ({int(timeout_s()-(end-time.monotonic()))}/{timeout_s()} с, '
+                f'видно текста: {seen} симв., вкладок: {len(ctx.pages)}, URL: {page.url[:100]})...')
             next_beat=time.monotonic()+60
         if quota(page):
             taskpath.unlink(missing_ok=True)
@@ -375,9 +461,10 @@ def _chat_one(name,storage,prompt,shots_dir=None):
             pg.bring_to_front()
             human(f'{name}: появилась проверка Cloudflare во время ответа. Пройди её в серверном браузере, затем «Выполнено» — ответ продолжит собираться.')
             if challenge(page):raise ManualRequired('Проверка не пройдена; прогресс сохранён')
-        cur=_answer_text(page)
-        seen=max(seen,len(cur))
-        busy=page.locator('[aria-busy=true]').count()>0 or page.get_by_role('button',name=re.compile('Stop|Остановить')).count()>0
+        cur=_answer_text(page,head)
+        if cur!=before:seen=max(seen,len(cur))
+        try:busy=page.locator('[aria-busy=true]').count()>0 or page.get_by_role('button',name=re.compile('Stop|Остановить',re.I)).count()>0
+        except Exception:busy=False
         if cur and cur!=before:
             stable=stable+1 if cur==last and not busy else 0;last=cur
             if stable>=8:
@@ -385,11 +472,17 @@ def _chat_one(name,storage,prompt,shots_dir=None):
                 _persist(name,ctx)
                 for old in ctx.pages[:-1]:old.close()
                 return cur
-    suggested=min(1800,timeout_s()*2)
-    hint=(f'Подними лимит: /параметр GENSPARK_TIMEOUT {suggested} и снова /make.'
-          if suggested>timeout_s() else
-          'Лимит уже максимальный (1800 с). Если активности генерации не видно — пришли свежий лог шага Create video.')
+    page=ctx.pages[-1]
     state_word='генерация ещё идёт' if busy else 'активности генерации не видно'
+    _diagnose(page,name,f'нет ответа за {timeout_s()} с ({state_word}, текста {seen} симв.)')
+    suggested=min(1800,timeout_s()*2)
+    if seen==0 and not busy:
+        # Поднимать лимит бесполезно: бот не видит ответ вообще — скорее всего, сменилась разметка.
+        hint=('Бот не нашёл блок ответа на странице — увеличение тайм-аута не поможет. '
+              'Скриншот страницы отправлен выше; если ответ на нём виден — пришли его, '
+              'либо задай селектор: /параметр GENSPARK_ANSWER_SELECTOR <css>.')
+    elif suggested>timeout_s():hint=f'Подними лимит: /параметр GENSPARK_TIMEOUT {suggested} и снова /make.'
+    else:hint='Лимит уже максимальный (1800 с). Скриншот страницы отправлен выше.'
     raise AnswerTimeout(f'Ответ не пришёл за {timeout_s()} с (видел текст: {seen} симв., {state_word}). {hint} '
                         'Прогресс сохранён, запрос повторно не отправляется.')
 
