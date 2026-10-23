@@ -250,7 +250,9 @@ def challenge(page):
 
 def quota(page):
     text=body_text(page)
-    return any(s in text for s in ('insufficient credits','not enough credits','daily limit reached','недостаточно кредитов','дневной лимит исчерпан'))
+    return any(s in text for s in ('insufficient credits','not enough credits','daily limit reached','недостаточно кредитов','дневной лимит исчерпан',
+                                   'used all your credits','used up all your credits','out of credits','credits exhausted','credits have run out',
+                                   'использовали все свои кредиты','использовали все кредиты','кредиты закончились','кредиты исчерпаны'))
 
 
 def notify(message,markup=None):
@@ -334,6 +336,11 @@ def _ready(name,ctx,url):
             try:pg.close()
             except Exception:pass
             continue
+        if _login_visible(pg) and os.environ.get('GENSPARK_TASK')=='create':
+            # Слот без входа (пропущен при регистрации): не просим вход посреди сборки, просто берём следующий.
+            try:pg.close()
+            except Exception:pass
+            raise AccountUnavailable('не выполнен вход')
         if challenge(pg) or _login_visible(pg):
             pg.bring_to_front()
             hint='\nХватит аккаунтов — жми «Сохранить и остановить»: уже вошедшие сохранятся.' if os.environ.get('GENSPARK_TASK')=='login' else ''
@@ -512,10 +519,10 @@ def _rotate(fn):
         if name in _state['blocked']:continue
         try:
             out=fn(name,st);_state['next']=(i+1)%len(acc);return out
-        except AccountUnavailable:
+        except AccountUnavailable as e:
             _state['blocked'].add(name);_state['next']=(i+1)%len(acc)
-            log(f'{name}: кредитов недостаточно; переход к следующему аккаунту.')
-    raise ManualRequired('Все включённые аккаунты сообщили о недостатке кредитов. Прогресс сохранён.')
+            log(f'{name}: {e}; переход к следующему аккаунту.')
+    raise ManualRequired('Во всех аккаунтах закончились кредиты или не выполнен вход. Прогресс сохранён.')
 
 
 def chat(prompt,as_json=True,search=False):
@@ -642,6 +649,7 @@ def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
                   'Если указанные параметры недоступны, остановись и сообщи, не трать кредиты. '
                   f'Движение: {prompt}')
     if mode=='agent' and not pending:
+        if quota(pg):raise AccountUnavailable('кредиты закончились (видно до отправки)')
         if not _attach(pg,image):
             _diagnose(pg,name,'не удалось прикрепить фото через «+» → «Просмотреть локальные файлы»')
             taskpath.unlink(missing_ok=True)
@@ -663,14 +671,14 @@ def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
               f'Фото на сервере: {Path(image).resolve()}. Запусти один раз, дождись готовности, нажми «Выполнено».',
               on_tick=lambda:atomic(taskpath,{'account':name,'url':ctx.pages[-1].url,'status':'awaiting-human'}))
     page=ctx.pages[-1];atomic(taskpath,{'account':name,'url':page.url,'status':'submitted'})
-    if quota(page):taskpath.unlink(missing_ok=True);raise AccountUnavailable('Кредитов недостаточно')
+    if quota(page):taskpath.unlink(missing_ok=True);raise AccountUnavailable('кредиты закончились')
     end=time.monotonic()+deadline_s
     while time.monotonic()<end:
         page=ctx.pages[-1]
         atomic(taskpath,{'account':name,'url':page.url,'status':'submitted'})
         if challenge(page) or _login_visible(page):
             page.bring_to_front();human('Пройди проверку / вход кнопкой «Открыть браузер», затем «Выполнено».')
-        if quota(page):taskpath.unlink(missing_ok=True);raise AccountUnavailable('Кредитов недостаточно')
+        if quota(page):taskpath.unlink(missing_ok=True);raise AccountUnavailable('кредиты закончились')
         src=_find_video_src(page)
         if src:
             target=Path(out_path);target.parent.mkdir(parents=True,exist_ok=True)
@@ -708,7 +716,10 @@ def animate(image_path,prompt,out_path=None):
     if owner:
         match=next(((n,s) for n,s in accounts_all() if n==owner),None)
         if not match:raise ManualRequired('Аккаунт начатого клипа недоступен; не отправляю сцену другому аккаунту повторно.')
-        return _animate_one(*match,image_path,prompt,None,target,video_timeout_s())
+        try:return _animate_one(*match,image_path,prompt,None,target,video_timeout_s())
+        except AccountUnavailable as e:
+            # Genspark ответил «кредиты закончились» — клип не делался, значит повтор на другом аккаунте не дубль.
+            _state['blocked'].add(owner);log(f'{owner}: {e}; сцена уходит на следующий аккаунт.')
     return _rotate(lambda name,st:_animate_one(name,st,image_path,prompt,None,target,video_timeout_s()))
 
 
