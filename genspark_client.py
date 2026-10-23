@@ -606,6 +606,22 @@ def _attach(pg,image):
     return bool(pg.locator('img[src^="blob:"],img[src^="data:"],[class*=attach] img,[class*=file] img,[class*=upload] img').count())
 
 
+_VIDEO_JS=r"""() => {
+  const vids=[...document.querySelectorAll('video')].reverse();
+  for(const v of vids){const u=v.currentSrc||v.src||v.querySelector('source')?.src||'';if(u)return u;}
+  const links=[...document.querySelectorAll('a[href],source[src]')].reverse();
+  for(const a of links){const u=a.href||a.src||'';if(/\.(mp4|webm|mov)(\?|#|$)/i.test(u))return u;}
+  const m=document.documentElement.innerHTML.match(/https?:\/\/[^"'\s<>]+?\.(?:mp4|webm|mov)(?:\?[^"'\s<>]*)?/gi);
+  return m?m[m.length-1].replace(/&amp;/g,'&'):'';
+}"""
+
+
+def _find_video_src(page):
+    # Genspark может показать клип не плеером <video>, а ссылкой/превью — ищем все варианты.
+    try:return page.evaluate(_VIDEO_JS) or ''
+    except Exception:return ''
+
+
 def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
     # Manual UI selection is intentional: home-page HTML does NOT establish video generator selectors.
     ctx=_context(name,storage)
@@ -655,26 +671,30 @@ def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
         if challenge(page) or _login_visible(page):
             page.bring_to_front();human('Пройди проверку / вход кнопкой «Открыть браузер», затем «Выполнено».')
         if quota(page):taskpath.unlink(missing_ok=True);raise AccountUnavailable('Кредитов недостаточно')
-        vids=page.locator('video').all()
-        if vids:
-            src=vids[-1].evaluate('el => el.currentSrc || el.src || el.querySelector("source")?.src || ""')
-            if src:
-                target=Path(out_path);target.parent.mkdir(parents=True,exist_ok=True)
-                tmp=target.with_suffix('.part.mp4')
-                if src.startswith('blob:'):
-                    data=page.evaluate('''async src => { const b=await (await fetch(src)).arrayBuffer();
-                      let x=''; const u=new Uint8Array(b); for(let i=0;i<u.length;i+=8192)x+=String.fromCharCode(...u.subarray(i,i+8192));return btoa(x);}''',src)
-                    tmp.write_bytes(base64.b64decode(data))
-                else:
-                    resp=ctx.request.get(src,timeout=60000)
-                    if not resp.ok:raise ManualRequired('Не удалось скачать готовый клип; генерацию не повторяю')
-                    tmp.write_bytes(resp.body())
-                tmp.replace(target) # keep download even when budget mismatch
-                inspect_video(target)
-                taskpath.unlink(missing_ok=True);_persist(name,ctx)
-                return target
+        src=_find_video_src(page)
+        if src:
+            target=Path(out_path);target.parent.mkdir(parents=True,exist_ok=True)
+            tmp=target.with_suffix('.part.mp4')
+            if src.startswith('blob:'):
+                data=page.evaluate('''async src => { const b=await (await fetch(src)).arrayBuffer();
+                  let x=''; const u=new Uint8Array(b); for(let i=0;i<u.length;i+=8192)x+=String.fromCharCode(...u.subarray(i,i+8192));return btoa(x);}''',src)
+                tmp.write_bytes(base64.b64decode(data))
+            else:
+                resp=ctx.request.get(src,timeout=60000)
+                if not resp.ok:raise ManualRequired('Не удалось скачать готовый клип; генерацию не повторяю')
+                tmp.write_bytes(resp.body())
+            tmp.replace(target) # keep download even when budget mismatch
+            inspect_video(target)
+            taskpath.unlink(missing_ok=True);_persist(name,ctx)
+            return target
         page.wait_for_timeout(1000)
-    raise ManualRequired('Готовый клип не найден. Задача сохранена, платную генерацию повторно не запускаю.')
+    # Клип не нашёлся: скриншот + ответ агента в Telegram (бесплатно), чтобы было видно, что случилось.
+    page=ctx.pages[-1]
+    _diagnose(page,name,'клип не найден за отведённое время')
+    reply=' '.join(_answer_text(page).split())[-400:]
+    raise ManualRequired('Готовый клип не найден. Задача сохранена, платную генерацию повторно не запускаю.'
+                         +(f' Ответ агента: «{reply}»' if reply else '')
+                         +f' Ссылка: {page.url}')
 
 
 def animate(image_path,prompt,out_path=None):
