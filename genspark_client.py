@@ -105,7 +105,7 @@ def accounts_all():
         if n=='all':n='1'
         out=[(f'account-{i}',{'cookies':[],'origins':[]}) for i in range(1,int(n)+1)]
     unique={}
-    for name,st in out:unique.setdefault(name,st)
+    for name,st in sorted(out,key=lambda x:_acc_num(x[0])):unique.setdefault(name,st)
     # Adding an account must work when previous accounts already have saved sessions.
     if remote():
         requested=os.environ.get('GENSPARK_ACCOUNTS') or '1'
@@ -115,7 +115,12 @@ def accounts_all():
                 name=f'account-{idx}'
                 unique.setdefault(name,{'cookies':[],'origins':[]})
                 idx+=1
-    return list(unique.items())
+    return sorted(unique.items(),key=lambda x:_acc_num(x[0]))
+
+
+def _acc_num(name):
+    # Числовой порядок: account-1, 2, ... 10, 11 (а не 1, 10, 11 ...), чтобы ротация начиналась с account-1.
+    m=re.search(r'(\d+)$',name);return int(m.group(1)) if m else 10**9
 
 
 def accounts_count():
@@ -565,11 +570,15 @@ def _animate_one(name,storage,image,prompt,shots,out_path,deadline_s):
     ctx=_context(name,storage)
     key=hashlib.sha256(Path(image).read_bytes()+prompt.encode()).hexdigest()
     taskpath=SESSIONS/f'task-{key}.json';pending=read(taskpath)
+    mode=os.environ.get('GENSPARK_VIDEO_MODE') or 'agent'
+    if mode=='agent' and pending and pending.get('status')!='submitted':
+        # Прошлый запуск не отправил задачу (статус awaiting-human) — это не дубль: бот отправит её сам.
+        taskpath.unlink(missing_ok=True);pending={}
     if pending.get('account') not in (None,name):raise ManualRequired('Эта сцена уже отправлена на другом аккаунте; дождись её результата, не создавай дубль.')
     pg=_ready(name,ctx,pending.get('url') or video_url())
     pg.bring_to_front()
-    atomic(taskpath,{'account':name,'url':pg.url,'status':'awaiting-human','settings':{'model':anim_model(),'duration':anim_duration_s(),'quality':anim_quality()}})
-    mode=os.environ.get('GENSPARK_VIDEO_MODE') or 'agent'
+    if mode!='agent':
+        atomic(taskpath,{'account':name,'url':pg.url,'status':'awaiting-human','settings':{'model':anim_model(),'duration':anim_duration_s(),'quality':anim_quality()}})
     instructions=(f'Используй инструмент генерации видео: модель {anim_model()}, ровно {anim_duration_s()} секунд, '
                   f'{anim_quality()}, один image-to-video клип из приложенной картинки. '
                   'Не подменяй модель более дорогой и не делай вариации. '
@@ -633,6 +642,8 @@ def animate(image_path,prompt,out_path=None):
     key=hashlib.sha256(Path(image_path).read_bytes()+prompt.encode()).hexdigest()
     pending=read(SESSIONS/f'task-{key}.json')
     owner=pending.get('account')
+    if (os.environ.get('GENSPARK_VIDEO_MODE') or 'agent')=='agent' and pending.get('status')!='submitted':
+        owner=None # неотправленная задача не держит аккаунт: ротация с account-1
     if owner:
         match=next(((n,s) for n,s in accounts_all() if n==owner),None)
         if not match:raise ManualRequired('Аккаунт начатого клипа недоступен; не отправляю сцену другому аккаунту повторно.')
