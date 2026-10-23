@@ -1600,6 +1600,18 @@ def trim_silence(path):
         tmp.replace(path)
 
 
+def _run_async(coro):
+    """asyncio.run, работающий и тогда, когда в этом потоке уже крутится цикл (его оставляет
+    Playwright sync API после оживления сцены): корутина выполняется в отдельном потоке."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
 def make_voice(text, path):
     if OFFLINE:
         run(["ffmpeg", "-y", "-f", "lavfi", "-i",
@@ -1613,7 +1625,7 @@ def make_voice(text, path):
         voice = VOICE if attempt < 4 else "ru-RU-SvetlanaNeural"
         rate = "+12%" if attempt % 2 == 0 else "+0%"
         try:
-            asyncio.run(_tts(clean, path, voice, rate))
+            _run_async(_tts(clean, path, voice, rate))
             if path.exists() and path.stat().st_size > 1000:
                 trim_silence(path)
                 time.sleep(0.7)
