@@ -555,16 +555,22 @@ def inspect_video(path):
 def _attach(pg,image):
     # Genspark 6.0: «+» (aria-label «Добавить файлы и другое») → меню → «Просмотреть локальные файлы» → диалог.
     # Разметка меню меняется, поэтому несколько бесплатных способов подряд (ничего не отправляется, кредиты не тратятся).
-    image=str(image)
+    # image может быть списком файлов (финальный монтаж): прикрепляем все разом.
+    many=isinstance(image,(list,tuple))
+    image=[str(x) for x in image] if many else str(image)
+    wait=3000+(len(image)*2000 if many else 0) # загрузка нескольких клипов дольше
     def via_input():
         fi=pg.locator('input[type=file]')
         if fi.count():
-            fi.last.set_input_files(image);pg.wait_for_timeout(3000);return True
+            el=fi.last
+            if many and el.get_attribute('multiple') is None:return False
+            el.set_input_files(image);pg.wait_for_timeout(wait);return True
         return False
     def click_chooser(el,timeout=6000):
         try:
             with pg.expect_file_chooser(timeout=timeout) as fc:el.click()
-            fc.value.set_files(image);pg.wait_for_timeout(3000);return True
+            if many and not fc.value.is_multiple():return False
+            fc.value.set_files(image);pg.wait_for_timeout(wait);return True
         except Exception:return False
     if via_input():return True
     plus=_first(pg,['.add-entry-btn',"[aria-label='Добавить файлы и другое']","[aria-label*='Добавить файлы' i]",
@@ -593,6 +599,7 @@ def _attach(pg,image):
             if not items:
                 try:plus.click()
                 except Exception:pass
+    if many:return False # paste/drop ниже — только для одной картинки
     # Запасной путь: вставка картинки из буфера (paste) и drop прямо в поле ввода.
     inp=_first(pg,INPUT_SELECTORS,2000)
     if inp is None:return False
