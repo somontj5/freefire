@@ -1,5 +1,5 @@
 """Final editing bridge: staged server-side assets -> Genspark -> verified final MP4.
-No automatic CAPTCHA interaction; manual confirmation before one site submission.
+No automatic CAPTCHA interaction; the bot submits the edit exactly once and waits for the export.
 The real Genspark editor DOM must be checked in the owner's first live session.
 """
 import json
@@ -96,40 +96,79 @@ def _edit_one(name,storage,folder,archive,manifest,ledger,target):
                   'Не меняй факты и голос диктора. При необходимости можно подготовить отдельные картинки '
                   'для графики только после согласования расходов. Не перегенерируй готовые видео. '
                   'Экспортируй готовый MP4 со звуком, 9:16. Это итоговый монтаж, не отдельная сцена.')
-    if not pending:
-        fi=page.locator('input[type=file]').first
-        if fi.count():
-            try:
-                if fi.get_attribute('multiple') is not None:fi.set_input_files([str(p) for p in files])
-                else:fi.set_input_files(str(archive))
-            except Exception:gc.log('Автоприкрепление недоступно; материалы остаются на сервере для ручного выбора.')
-        inp=gc._first(page,gc.INPUT_SELECTORS,3000)
-        if inp is not None:inp.fill(instructions) # fill only, no surprise paid submission
-        atomic(ledger,{'account':name,'url':page.url,'status':'awaiting-approval'})
-    gc.human(f'{name}: ФИНАЛЬНЫЙ МОНТАЖ В GENSPARK. '
-             f'Проверь, что открыт нужный редактор и прикреплены все материалы из {folder.resolve()} '
-             f'или архив {archive.resolve()}. Инструкция: {instructions}\n'
-             'Запусти монтаж один раз и дождись готового экспорта. Если задача уже существует — продолжи её. '
-             'Только после готовности нажми «Выполнено». Отдельные платные ассеты подтверждай в интерфейсе сайта.',
-             on_tick=lambda:atomic(ledger,{'account':name,'url':ctx.pages[-1].url,'status':'awaiting-human'}))
+    if pending.get('status')!='submitted':
+        # Задача ещё не отправлена (или прошлый запуск ждал ручных действий) — бот отправляет сам, ровно один раз.
+        if gc.quota(page):ledger.unlink(missing_ok=True);raise gc.AccountUnavailable('кредиты закончились (видно до отправки)')
+        # Genspark принимает несколько файлов; если нет — архив одним файлом.
+        if not (gc._attach(page,files) or gc._attach(page,archive)):
+            gc._diagnose(page,name,'монтаж: не удалось прикрепить материалы')
+            ledger.unlink(missing_ok=True)
+            raise gc.ManualRequired('Не удалось прикрепить материалы монтажа. Скриншот отправлен; кредиты не потрачены.')
+        inp=gc._first(page,gc.INPUT_SELECTORS,5000)
+        if inp is None:raise gc.BrowserLayoutError('Не найдено поле ввода для монтажа; ничего не отправлено')
+        inp.fill(instructions)
+        before=set(_media_links(page))
+        atomic(ledger,{'account':name,'url':page.url,'status':'submitted','before':sorted(before)})
+        if not gc._submit(page,inp):
+            gc._diagnose(page,name,'монтаж: запрос не отправился')
+            ledger.unlink(missing_ok=True)
+            raise gc.BrowserLayoutError('Задание монтажа не отправилось (текст остался в поле). Скриншот отправлен; кредиты не потрачены.')
+        gc.log(f'{name}: монтаж отправлен один раз; жду экспорт до {gc.number("GENSPARK_EDITOR_TIMEOUT")} с.')
+        atomic(ledger,{'account':name,'url':page.url,'status':'submitted','before':sorted(before)})
+    else:
+        before=set(pending.get('before') or [])
+        gc.log(f'{name}: монтаж уже отправлен ранее — жду результат, повторно не отправляю.')
     page=ctx.pages[-1]
     if gc.quota(page):
-        ledger.unlink(missing_ok=True);raise gc.AccountUnavailable()
+        ledger.unlink(missing_ok=True);raise gc.AccountUnavailable('кредиты закончились')
     end=time.monotonic()+gc.number('GENSPARK_EDITOR_TIMEOUT')
+    next_beat=time.monotonic()+120
     while time.monotonic()<end:
-        # Prefer final export download, NOT an arbitrary scene preview <video>.
-        selector=os.environ.get('GENSPARK_FINAL_DOWNLOAD_SELECTOR')
-        link=page.locator(selector).last if selector else page.locator('a[download][href]').last
-        if link.count() and link.is_visible():
-            url=link.get_attribute('href')
-            if url:
-                from urllib.parse import urljoin
-                _download(page,urljoin(page.url,url),target)
+        page=ctx.pages[-1]
+        atomic(ledger,{'account':name,'url':page.url,'status':'submitted','before':sorted(before)})
+        if gc.challenge(page) or gc._login_visible(page):
+            page.bring_to_front();gc.human('Пройди проверку / вход кнопкой «Открыть браузер», затем «Выполнено». Монтаж повторно не отправляется.')
+        if gc.quota(page):ledger.unlink(missing_ok=True);raise gc.AccountUnavailable('кредиты закончились')
+        if time.monotonic()>=next_beat:
+            gc.log(f'{name}: монтаж ещё идёт ({int(gc.number("GENSPARK_EDITOR_TIMEOUT")-(end-time.monotonic()))} с)...')
+            next_beat=time.monotonic()+120
+        # Готовый экспорт = новая ссылка на видео, которой не было до отправки (прикреплённые клипы не считаются).
+        fresh=[u for u in _media_links(page) if u not in before]
+        if fresh:
+            from urllib.parse import urljoin
+            try:
+                _download(page,urljoin(page.url,fresh[-1]),target)
                 verify_final(target,manifest['total_duration'])
                 atomic(ledger,{'account':name,'url':page.url,'status':'complete'})
                 gc._persist(name,ctx);return target
-        page.wait_for_timeout(1000)
-    raise gc.ManualRequired('Готовая ссылка экспорта не найдена; задача монтажа сохранена, дубль не запускается. Укажи GENSPARK_FINAL_DOWNLOAD_SELECTOR для реального UI.')
+            except Exception as e:
+                # Это не финал (наш прикреплённый клип, wav, zip, промежуточное видео) — ждём дальше, не перезаказываем.
+                gc.log(f'{name}: найден файл, но это не финал ({str(e)[:120]}); жду дальше.')
+                before.add(fresh[-1]);target.unlink(missing_ok=True)
+        page.wait_for_timeout(3000)
+    gc._diagnose(ctx.pages[-1],name,'монтаж: экспорт не найден за отведённое время')
+    reply=' '.join(gc._answer_text(ctx.pages[-1]).split())[-400:]
+    raise gc.ManualRequired('Готовый экспорт монтажа не найден; задача сохранена, дубль не запускается.'
+                            +(f' Ответ агента: «{reply}»' if reply else '')+f' Ссылка: {ctx.pages[-1].url}')
+
+
+_MEDIA_JS=r"""() => {
+  const out=[];const add=u=>{if(u&&!u.startsWith('data:')&&!out.includes(u))out.push(u);};
+  const sel=window.__finalSel;
+  if(sel)document.querySelectorAll(sel).forEach(e=>add(e.href||e.src||''));
+  document.querySelectorAll('video').forEach(v=>add(v.currentSrc||v.src||v.querySelector('source')?.src||''));
+  document.querySelectorAll('a[href],source[src]').forEach(a=>{const u=a.href||a.src||'';if(/\.(mp4|webm|mov)(\?|#|$)/i.test(u)||a.hasAttribute('download'))add(u);});
+  (document.documentElement.innerHTML.match(/https?:\/\/[^"'\s<>]+?\.(?:mp4|webm|mov)(?:\?[^"'\s<>]*)?/gi)||[]).forEach(u=>add(u.replace(/&amp;/g,'&')));
+  return out;
+}"""
+
+
+def _media_links(page):
+    try:
+        sel=os.environ.get('GENSPARK_FINAL_DOWNLOAD_SELECTOR') or ''
+        if sel:page.evaluate('s=>{window.__finalSel=s}',sel)
+        return page.evaluate(_MEDIA_JS) or []
+    except Exception:return []
 
 
 def edit(job_dir,story,audios,durations):
@@ -137,8 +176,12 @@ def edit(job_dir,story,audios,durations):
     if target.exists():verify_final(target,sum(durations));return target
     folder,archive,manifest=prepare(job_dir,story,audios,durations)
     ledger=job_dir/'editor-state.json';pending=read(ledger)
+    if pending.get('status')!='submitted':
+        ledger.unlink(missing_ok=True);pending={} # не отправленная задача не держит аккаунт
     if pending.get('account'):
         owner=next(((n,st) for n,st in gc.accounts_all() if n==pending['account']),None)
         if owner is None:raise gc.ManualRequired('Аккаунт начатого монтажа недоступен; новая задача не создаётся')
-        return _edit_one(*owner,folder,archive,manifest,ledger,target)
+        try:return _edit_one(*owner,folder,archive,manifest,ledger,target)
+        except gc.AccountUnavailable as e:
+            gc._state['blocked'].add(owner[0]);gc.log(f'{owner[0]}: {e}; монтаж уходит на следующий аккаунт.')
     return gc._rotate(lambda n,st:_edit_one(n,st,folder,archive,manifest,ledger,target))
