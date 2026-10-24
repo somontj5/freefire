@@ -68,12 +68,12 @@ PICKS={
  'GENSPARK_ANIM_QUALITY':['480p','720p'], 'GENSPARK_ANIM_MODEL':['Grok lite'],
  'MAX_ANIMATE':['3','6','10','20'], 'ANIMATE':['1','0'],
  'GENSPARK_MANUAL_WAIT':['300','600','900'], 'GENSPARK_VIDEO_MODE':['agent','manual'],
- 'GENSPARK_FINAL_EDITOR':['genspark','local'], 'GENSPARK_ALLOW_FALLBACK':['0','1'],
+ 'GENSPARK_FINAL_EDITOR':['genspark','local'], 'GENSPARK_EDITOR_CHUNK':['2','3','4','6'], 'GENSPARK_ALLOW_FALLBACK':['0','1'],
 }
 LABELS={'GENSPARK_ACCOUNTS':'Аккаунты','GENSPARK_ANIM_DURATION':'Секунды','GENSPARK_ANIM_QUALITY':'Разрешение',
         'GENSPARK_ANIM_MODEL':'Модель видео','MAX_ANIMATE':'Оживляемых сцен','ANIMATE':'Оживление',
         'GENSPARK_MANUAL_WAIT':'Ожидание подтверждения','GENSPARK_VIDEO_MODE':'Запуск видео',
-        'GENSPARK_FINAL_EDITOR':'Монтаж','GENSPARK_ALLOW_FALLBACK':'API-запасной путь'}
+        'GENSPARK_FINAL_EDITOR':'Монтаж','GENSPARK_EDITOR_CHUNK':'Сцен в куске монтажа','GENSPARK_ALLOW_FALLBACK':'API-запасной путь'}
 
 
 def settings_menu(api,chat,mid):

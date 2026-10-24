@@ -14,17 +14,22 @@ import genspark_client as gc
 from remote_control import atomic,read
 
 
-def prepare(job_dir,story,audios,durations):
-    job_dir=Path(job_dir); folder=job_dir/'editor-inputs';folder.mkdir(exist_ok=True)
+def prepare(job_dir,story,audios,durations,idx=None,name='editor-inputs'):
+    job_dir=Path(job_dir); folder=job_dir/name;folder.mkdir(exist_ok=True)
+    for old in folder.iterdir():
+        if old.is_file():old.unlink()
+    idx=list(range(len(story['scenes']))) if idx is None else list(idx)
+    audios=[audios[i] for i in idx];durations=[durations[i] for i in idx]
     total=sum(durations)
     assets=[]
-    for i,sc in enumerate(story['scenes']):
+    for n,i in enumerate(idx):
+        sc=story['scenes'][i]
         source=job_dir/f's{i:02d}_anim.mp4'
         if not source.exists():source=job_dir/f's{i:02d}_img.png'
         if not source.exists():raise ValueError(f'Нет сохранённого материала сцены {i+1}')
         target=folder/source.name;shutil.copyfile(source,target)
         assets.append({'scene':i+1,'file':target.name,'narration':sc['narration'],
-                       'duration':durations[i], 'motion_prompt':sc.get('motion_prompt',''),
+                       'duration':durations[n], 'motion_prompt':sc.get('motion_prompt',''),
                        'card':sc.get('card'), 'sfx':sc.get('sfx','none')})
     # Normalize different saved voice containers to WAV before concat.
     voices=[]
@@ -42,14 +47,14 @@ def prepare(job_dir,story,audios,durations):
     for p in voices:p.unlink()
     manifest={'title':story['title'],'caption':story.get('caption',''),'total_duration':total,
               'narration':'narration.wav','scenes':assets,
-              'editing_instructions':{'music':'Generate instrumental music matching scene moods; quiet under narration',
+              'editing_instructions':{'music':'NONE - music is added later by the server; do not generate music',
+                                      'sfx':'NONE - sound effects are added later by the server; do not generate SFX',
                                       'subtitles':'Russian, word-synced to narration; no invented speech',
-                                      'sfx':'Subtle whooshes/impacts at motivated transitions',
-                                      'motion_design':'Animate title/cards, graphics and diagrams when useful; preserve character identity',
-                                      'format':'vertical 9:16; export ready MP4 with audio',
-                                      'budget':'Use existing clips/images; do not generate paid replacement video clips without approval'}}
+                                      'motion_design':'Animate title/cards and simple graphics with code/templates only; preserve character identity',
+                                      'format':'vertical 9:16; export ready MP4 with the narration audio',
+                                      'budget':'Minimal credits: no paid generation of music, SFX, images or video; use only attached files'}}
     (folder/'project.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf8')
-    archive=job_dir/'editor-inputs.zip'
+    archive=job_dir/f'{name}.zip'
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
         for p in folder.iterdir():
             if p.is_file():z.write(p,p.name)
@@ -88,14 +93,13 @@ def _edit_one(name,storage,folder,archive,manifest,ledger,target):
     ctx=gc._context(name,storage);pending=read(ledger)
     page=gc._ready(name,ctx,pending.get('url') or gc.base_url());page.bring_to_front()
     files=[p for p in folder.iterdir() if p.is_file()]
-    instructions=(f'Используй инструменты Genspark для монтажа видео, генерации музыки, субтитров и моушен-дизайна. '
-                  f'Смонтируй вертикальный ролик по приложенным материалам и project.json. '
-                  f'Озвучку narration.wav сохрани целиком. Длительность около {manifest["total_duration"]:.1f} с. '
-                  'Нарежь готовые клипы под диктора, добавь музыку по настроению, русские субтитры по словам, '
-                  'уместные SFX и моушен-дизайн: анимированные заголовки, карточки и графику. '
-                  'Не меняй факты и голос диктора. При необходимости можно подготовить отдельные картинки '
-                  'для графики только после согласования расходов. Не перегенерируй готовые видео. '
-                  'Экспортируй готовый MP4 со звуком, 9:16. Это итоговый монтаж, не отдельная сцена.')
+    instructions=(f'Смонтируй вертикальный фрагмент ролика 9:16 по приложенным материалам и project.json. '
+                  f'Озвучку narration.wav сохрани целиком, без изменений. Длительность ровно {manifest["total_duration"]:.1f} с. '
+                  'Нарежь приложенные клипы/картинки под диктора по порядку сцен, добавь русские субтитры по словам '
+                  'и простой моушен-дизайн (анимированные заголовки, карточки) кодом или шаблонами. '
+                  'ЭКОНОМЬ КРЕДИТЫ: НЕ генерируй музыку, SFX, картинки и видео — музыку и звуки сервер добавит сам. '
+                  'Не открывай страницы оплаты. Если кредитов не хватает — остановись и напиши об этом. '
+                  'Не меняй факты и голос диктора. Экспортируй готовый MP4 со звуком и дай ссылку на скачивание.')
     if pending.get('status')!='submitted':
         # Задача ещё не отправлена (или прошлый запуск ждал ручных действий) — бот отправляет сам, ровно один раз.
         if gc.quota(page):ledger.unlink(missing_ok=True);raise gc.AccountUnavailable('кредиты закончились (видно до отправки)')
@@ -157,7 +161,7 @@ _MEDIA_JS=r"""() => {
   const sel=window.__finalSel;
   if(sel)document.querySelectorAll(sel).forEach(e=>add(e.href||e.src||''));
   document.querySelectorAll('video').forEach(v=>add(v.currentSrc||v.src||v.querySelector('source')?.src||''));
-  document.querySelectorAll('a[href],source[src]').forEach(a=>{const u=a.href||a.src||'';if(/\.(mp4|webm|mov)(\?|#|$)/i.test(u)||a.hasAttribute('download'))add(u);});
+  document.querySelectorAll('a[href],source[src]').forEach(a=>{const u=a.href||a.src||'';if(/\.(mp4|webm|mov)(\?|#|$)/i.test(u)||a.hasAttribute('download')||u.includes('/api/files/'))add(u);});
   (document.documentElement.innerHTML.match(/https?:\/\/[^"'\s<>]+?\.(?:mp4|webm|mov)(?:\?[^"'\s<>]*)?/gi)||[]).forEach(u=>add(u.replace(/&amp;/g,'&')));
   return out;
 }"""
@@ -185,3 +189,68 @@ def edit(job_dir,story,audios,durations):
         except gc.AccountUnavailable as e:
             gc._state['blocked'].add(owner[0]);gc.log(f'{owner[0]}: {e}; монтаж уходит на следующий аккаунт.')
     return gc._rotate(lambda n,st:_edit_one(n,st,folder,archive,manifest,ledger,target))
+
+
+def edit_split(job_dir,story,audios,durations,chunk=3,time_left=lambda:True):
+    """Монтаж кусками: каждые `chunk` сцен — отдельная задача Genspark, аккаунты по очереди (ротация).
+    Возвращает {индекс_первой_сцены: (mp4, кол-во сцен)} для получившихся кусков.
+    Неудачный кусок не повторяется (кредиты) — его соберёт ffmpeg на сервере."""
+    job_dir=Path(job_dir);n=len(story['scenes']);out={};no_credits=False
+    for k,start in enumerate(range(0,n,chunk)):
+        idx=list(range(start,min(n,start+chunk)))
+        target=job_dir/f'genspark-part-{k:02d}.mp4';ledger=job_dir/f'editor-part-{k:02d}.json'
+        expected=sum(durations[i] for i in idx)
+        if target.exists():
+            try:verify_final(target,expected);out[start]=(target,len(idx));continue
+            except Exception:target.unlink(missing_ok=True)
+        pending=read(ledger)
+        if pending.get('status')=='local':continue # уже решено собрать ffmpeg — кредиты повторно не тратим
+        if no_credits and pending.get('status')!='submitted':
+            atomic(ledger,{'status':'local','error':'нет кредитов'});continue
+        if not time_left():
+            gc.log(f'монтаж: кусок {k+1} — время сборки на исходе, соберу ffmpeg.');continue
+        try:
+            folder,archive,manifest=prepare(job_dir,story,audios,durations,idx,f'editor-part-{k:02d}')
+            if pending.get('status')!='submitted':ledger.unlink(missing_ok=True);pending={}
+            res=None
+            if pending.get('account'):
+                owner=next(((a,st) for a,st in gc.accounts_all() if a==pending['account']),None)
+                if owner:
+                    try:res=_edit_one(*owner,folder,archive,manifest,ledger,target)
+                    except gc.AccountUnavailable as e:
+                        gc._state['blocked'].add(owner[0]);gc.log(f'{owner[0]}: {e}; кусок {k+1} уходит на другой аккаунт.')
+            if res is None:res=gc._rotate(lambda a,st:_edit_one(a,st,folder,archive,manifest,ledger,target))
+            out[start]=(res,len(idx));gc.log(f'монтаж: кусок {k+1} (сцены {idx[0]+1}–{idx[-1]+1}) готов в Genspark.')
+        except gc.UserStopped:raise
+        except Exception as e:
+            atomic(ledger,{**read(ledger),'status':'local','error':str(e)[:300]})
+            gc.log(f'монтаж: кусок {k+1} не вышел в Genspark ({str(e)[:200]}); соберу его ffmpeg, повтор не отправляю.')
+            if 'Во всех аккаунтах' in str(e):no_credits=True
+    return out
+
+
+def recover_single(job_dir,expected):
+    """Старая (неразделённая) задача монтажа уже была отправлена: бесплатно проверяем её чат —
+    если агент дал готовый MP4, забираем его. Ничего не отправляем."""
+    job_dir=Path(job_dir);ledger=job_dir/'editor-state.json';pending=read(ledger)
+    target=job_dir/'genspark-final.mp4'
+    if target.exists():
+        try:verify_final(target,expected);return target
+        except Exception:target.unlink(missing_ok=True)
+    if pending.get('status')!='submitted' or not pending.get('url'):return None
+    owner=next(((a,st) for a,st in gc.accounts_all() if a==pending.get('account')),None)
+    if owner is None:return None
+    try:
+        ctx=gc._context(*owner);page=gc._ready(owner[0],ctx,pending['url'])
+        page.wait_for_timeout(5000)
+        from urllib.parse import urljoin
+        for u in reversed([u for u in _media_links(page) if u not in set(pending.get('before') or [])]):
+            try:
+                _download(page,urljoin(page.url,u),target);verify_final(target,expected)
+                atomic(ledger,{**pending,'status':'complete'});gc.log('монтаж: забрал готовый ролик из прошлой задачи.')
+                return target
+            except Exception:target.unlink(missing_ok=True)
+    except gc.UserStopped:raise
+    except Exception as e:gc.log(f'монтаж: прошлую задачу проверить не удалось ({str(e)[:150]}).')
+    atomic(ledger,{**pending,'status':'checked'}) # больше не проверяем и не ждём
+    return None

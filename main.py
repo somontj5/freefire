@@ -2562,6 +2562,26 @@ def music_input(total, music=None):
     return ["-f", "lavfi", "-t", f"{total:.1f}", "-i", f"aevalsrc='{expr}':s=44100:c=stereo"]
 
 
+def merge_editor_parts(clips, durs, trans, parts):
+    """Куски из Genspark (по несколько сцен) заменяют соответствующие клипы. Звук кусков отбрасывается:
+    голос, музыку и SFX кладёт сервер. Каждый кусок приводится к 1080x1920 и длине (сумма фраз + переход)."""
+    c2, d2, t2, i = [], [], [], 0
+    while i < len(clips):
+        if i in parts:
+            src, m = parts[i]
+            m = min(m, len(clips) - i)
+            d = round(sum(durs[i:i + m]), 2)
+            out = WORK / f"gs_part_{i:02d}.mp4"
+            run(["ffmpeg", "-y", "-i", str(src), "-vf",
+                 f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS},"
+                 f"tpad=stop_mode=clone:stop_duration={OVERLAP + 1},format=yuv420p",
+                 "-t", f"{d + OVERLAP:.2f}", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", str(out)])
+            c2.append(out); d2.append(d); t2.append(trans[i] if trans else None); i += m
+        else:
+            c2.append(clips[i]); d2.append(durs[i]); t2.append(trans[i] if trans else None); i += 1
+    return c2, d2, (t2 if trans else None)
+
+
 def assemble(clips, audios, durs, out, trans=None, sfx_track=None, music=None):
     n = len(clips)
     total_audio = sum(durs)
@@ -3262,38 +3282,58 @@ def cmd_create():
         final = WORK / "final.mp4"
         if story_mode and img_fail:
             notify(f"⚠️ Не удалось нарисовать картинок: {img_fail}. Вместо них использованы соседние кадры.")
+        gs_parts = {}
         if story_mode and (ENV('GENSPARK_FINAL_EDITOR') or config.DEFAULTS['GENSPARK_FINAL_EDITOR'])=='genspark' and not OFFLINE:
+            # Монтаж в Genspark кусками по аккаунтам (только нарезка/субтитры/моушен). Музыку и SFX
+            # всегда делает сервер бесплатно; любой не получившийся кусок собирает ffmpeg — сборка не встаёт.
             import editor_client
             ck_put(vid,story=story,facts=facts,sources=sources,claims=claim_issues,status='running')
             try:
-                edited=editor_client.edit(JOBS/vid,story,audios,durs)
-                shutil.copyfile(edited,final)
-            except Exception as e:
-                raise QuotaPause(f'Финальный монтаж приостановлен ({e}); задача и материалы сохранены') from None
-        else:
-            if story_mode:
-                sfx_track = None
-                if plans:
-                    try:
-                        fxm = _fx()
-                        ev = fxm.sound_events(durs, story["scenes"], plans, trans, fxm.music_cuts(plan_m) if plan_m else None)
-                        sfx_track = fxm.build_sfx_track(ev, sum(durs) + OVERLAP, WORK, WORK / "sfx_auto.wav")
-                    except Exception as e:  # noqa
-                        if isinstance(e, QuotaPause):
-                            raise
-                        log("свисты и удары на переходах не получились:", str(e)[:140])
-                    if parallax_used:
-                        log(f"параллакс героя в сценах: {parallax_used}")
-                music_arg = mus
-                if plan_m:
-                    try:
-                        bed = _fx().build_music_bed(plan_m, sum(durs) + OVERLAP, WORK, WORK / "music_bed.wav")
-                        music_arg = {"path": bed}
-                    except Exception as e:  # noqa
-                        if isinstance(e, QuotaPause):
-                            raise
-                        log("склейка музыки не вышла, беру один фон:", str(e)[-200:])
-                        music_arg = prepare_music_single()
+                whole = editor_client.recover_single(JOBS/vid, sum(durs))
+                if whole:
+                    gs_parts = {0: (whole, len(clips))}
+                else:
+                    chunk = int(ENV('GENSPARK_EDITOR_CHUNK') or config.DEFAULTS['GENSPARK_EDITOR_CHUNK'])
+                    gs_parts = editor_client.edit_split(JOBS/vid, story, audios, durs, chunk, lambda: not over_budget())
+            except Exception as e:  # noqa
+                if isinstance(e, genspark_client.UserStopped):
+                    raise QuotaPause(f'Монтаж остановлен тобой ({e})') from None
+                log(f"монтаж в Genspark не вышел ({str(e)[:200]}), собираю всё ffmpeg")
+                gs_parts = {}
+            log(f"монтаж: кусков из Genspark {len(gs_parts)}, остальное собирает ffmpeg")
+        if story_mode:
+            sfx_track = None
+            if plans:
+                try:
+                    fxm = _fx()
+                    ev = fxm.sound_events(durs, story["scenes"], plans, trans, fxm.music_cuts(plan_m) if plan_m else None)
+                    sfx_track = fxm.build_sfx_track(ev, sum(durs) + OVERLAP, WORK, WORK / "sfx_auto.wav")
+                except Exception as e:  # noqa
+                    if isinstance(e, QuotaPause):
+                        raise
+                    log("свисты и удары на переходах не получились:", str(e)[:140])
+                if parallax_used:
+                    log(f"параллакс героя в сценах: {parallax_used}")
+            music_arg = mus
+            if plan_m:
+                try:
+                    bed = _fx().build_music_bed(plan_m, sum(durs) + OVERLAP, WORK, WORK / "music_bed.wav")
+                    music_arg = {"path": bed}
+                except Exception as e:  # noqa
+                    if isinstance(e, QuotaPause):
+                        raise
+                    log("склейка музыки не вышла, беру один фон:", str(e)[-200:])
+                    music_arg = prepare_music_single()
+            if gs_parts:
+                try:
+                    c2, d2, t2 = merge_editor_parts(clips, durs, trans, gs_parts)
+                    assemble(c2, audios, d2, final, t2, sfx_track, music_arg)
+                    gs_parts = "ok"
+                except Exception as e:  # noqa
+                    if isinstance(e, QuotaPause):
+                        raise
+                    log(f"склейка кусков Genspark не вышла ({str(e)[-200:]}), собираю ffmpeg из своих клипов")
+            if gs_parts != "ok":
                 try:
                     assemble(clips, audios, durs, final, trans, sfx_track, music_arg)
                 except Exception as e:  # noqa
@@ -3302,8 +3342,8 @@ def cmd_create():
                     log(f"сборка с новыми переходами и звуком не вышла ({str(e)[-200:]}), собираю по-простому")
                     RUN["fx_fail"] += 1
                     assemble(clips, audios, durs, final)
-            else:
-                concat(parts, final)
+        else:
+            concat(parts, final)
     except NoStory as e:
         notify(f"🔎 {e}")
         return
