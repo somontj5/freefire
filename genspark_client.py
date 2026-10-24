@@ -249,10 +249,14 @@ def challenge(page):
 
 
 def quota(page):
+    try:
+        if any(x in page.url.lower() for x in ('/pricing','/upgrade','/subscribe','/checkout')):return True
+    except Exception:pass
     text=body_text(page)
     return any(s in text for s in ('insufficient credits','not enough credits','daily limit reached','недостаточно кредитов','дневной лимит исчерпан',
                                    'used all your credits','used up all your credits','out of credits','credits exhausted','credits have run out',
-                                   'использовали все свои кредиты','использовали все кредиты','кредиты закончились','кредиты исчерпаны'))
+                                   'использовали все свои кредиты','использовали все кредиты','кредиты закончились','кредиты исчерпаны',
+                                   'улучшить подписку','upgrade your plan','upgrade plan'))
 
 
 def notify(message,markup=None):
